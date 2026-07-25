@@ -192,3 +192,11 @@ a full mutated copy of `source`. Register the new module in `_LANGUAGES` in
   tweaks, condition negation) -- these are the ones that will actually
   populate `Mutant.mutated` and print a `+` line.
 * Additional language backends.
+
+## Contributing
+
+This project uses Black to ensure a consistent code style and Pyright for static type checking. To avoid version mismatches and CI failures, format and check your code locally using [pre-commit](https://pre-commit.com/) by running the command below once; this installs a git hook that will automatically check and format your staged files during every `git commit`.
+
+```sh
+pip install pre-commit && pre-commit install
+```

@@ -1,0 +1,11 @@
+repos:
+  - repo: https://github.com/psf/black
+    rev: 24.4.2
+    hooks:
+      - id: black
+
+  - repo: https://github.com/RobertCraigie/pyright-python
+    rev: v1.1.373
+    hooks:
+      - id: pyright
+        additional_dependencies: [pycparser]

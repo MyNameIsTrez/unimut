@@ -74,16 +74,54 @@ _STDINT_PREAMBLE = (
 )
 
 _KNOWN_BASE_TYPES = {
-    "int", "char", "float", "double", "void", "short", "long", "unsigned",
-    "signed", "_Bool", "bool", "size_t", "ptrdiff_t",
-    "int8_t", "int16_t", "int32_t", "int64_t",
-    "uint8_t", "uint16_t", "uint32_t", "uint64_t",
-    "struct", "union", "enum",
-    "const", "static", "extern", "register", "volatile", "inline", "auto",
+    "int",
+    "char",
+    "float",
+    "double",
+    "void",
+    "short",
+    "long",
+    "unsigned",
+    "signed",
+    "_Bool",
+    "bool",
+    "size_t",
+    "ptrdiff_t",
+    "int8_t",
+    "int16_t",
+    "int32_t",
+    "int64_t",
+    "uint8_t",
+    "uint16_t",
+    "uint32_t",
+    "uint64_t",
+    "struct",
+    "union",
+    "enum",
+    "const",
+    "static",
+    "extern",
+    "register",
+    "volatile",
+    "inline",
+    "auto",
 }
 _C_KEYWORDS = _KNOWN_BASE_TYPES | {
-    "if", "else", "for", "while", "do", "switch", "case", "default",
-    "break", "continue", "return", "goto", "sizeof", "typedef", "restrict",
+    "if",
+    "else",
+    "for",
+    "while",
+    "do",
+    "switch",
+    "case",
+    "default",
+    "break",
+    "continue",
+    "return",
+    "goto",
+    "sizeof",
+    "typedef",
+    "restrict",
 }
 
 # ALL_CAPS token that sits directly in front of "identifier(" -- almost
@@ -167,9 +205,7 @@ def find_regions(source: str) -> List[Region]:
                     f"'{MARK_START}'"
                 )
             code = "\n".join(lines[start_idx + 1 : i])
-            regions.append(
-                Region(start_line=start_idx + 2, end_line=i, code=code)
-            )
+            regions.append(Region(start_line=start_idx + 2, end_line=i, code=code))
             start_idx = None
     if start_idx is not None:
         raise MutationError(
@@ -423,6 +459,7 @@ import os
 
 _CC = shutil.which("cc") or shutil.which("gcc") or shutil.which("clang")
 
+
 def _compiles(c_source: str) -> bool:
     """Compile a C source string with the system compiler; True on success."""
     assert _CC, "no C compiler found on PATH"
@@ -487,9 +524,7 @@ class TestFindRegions(unittest.TestCase):
 
     def test_nested_start_raises(self):
         with self.assertRaises(MutationError):
-            find_regions(
-                "// unimut start\n// unimut start\nint a;\n// unimut stop\n"
-            )
+            find_regions("// unimut start\n// unimut start\nint a;\n// unimut stop\n")
 
 
 class TestSimpleRemoval(unittest.TestCase):
@@ -624,6 +659,7 @@ class TestUnparsableRegionRaises(unittest.TestCase):
         src = "// unimut start\nthis is not ) ( valid c at all {{{\n// unimut stop\n"
         with self.assertRaises(MutationError):
             generate_mutants("bad.c", src)
+
 
 if __name__ == "__main__":
     unittest.main()
