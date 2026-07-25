@@ -1,9 +1,6 @@
 # unimut
 
-`unimut` is a small, focused mutation-testing tool. You mark a region of a
-source file with `// unimut start` / `// unimut stop`, point `unimut` at a
-command that builds and tests your project, and it tries every mutation of
-the marked code to see which ones your test suite fails to notice.
+`unimut` is a small, focused mutation-testing tool designed for local development. You temporarily mark a region of a source file with `// unimut start` / `// unimut stop` (these markers should not be committed), point `unimut` at a command that builds and tests your project, and it tries every mutation of the marked code to see which ones your test suite fails to notice.
 
 A mutant your tests catch (the `--run` command fails) is **killed** and, by
 default, not shown -- that's the good outcome. A mutant your tests don't
