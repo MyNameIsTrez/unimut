@@ -1,11 +1,13 @@
 # unimut
 
-`unimut` is a small, focused mutation-testing tool designed for local development. You temporarily mark a region of a source file with `// unimut start` / `// unimut stop` (these markers should not be committed), point `unimut` at a command that builds and tests your project, and it tries every mutation of the marked code to see which ones your test suite fails to notice.
+`unimut` (universal mutator) is a small, focused mutation-testing tool designed for local development to find the tests you are missing. It is called "universal" because it is built to work for many programming languages, and it allows you to register custom backends for any missing languages.
+
+You temporarily mark a region of a source file with `// unimut start` / `// unimut stop` (these markers should not be committed) and pass `unimut` a command that builds and tests your project. It then tries every mutation of the marked code to see which ones your test suite fails to notice.
 
 A mutant your tests catch (the `--run` command fails) is **killed** and, by
 default, not shown -- that's the good outcome. A mutant your tests don't
 catch (the `--run` command still exits 0) **survived**, and gets printed:
-that's a sign the corresponding code path isn't well covered.
+that's a sign you are missing a test.
 
 ```diff
 $ unimut --file src/lj_ffrecord.c --run 'make -j$(nproc) && PATH="$PWD/src:$PATH" perl t/unpack.t'
