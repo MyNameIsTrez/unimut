@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unimut"
+version = "0.1.0"
+description = "Mutation testing for hand-marked regions of source files"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [
+    { name = "Sander" },
+]
+keywords = ["mutation testing", "testing", "c", "pycparser"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "pycparser>=2.21",
+]
+
+[project.urls]
+Homepage = "https://github.com/grug-lang/unimut"
+Issues = "https://github.com/grug-lang/unimut/issues"
+
+[project.scripts]
+unimut = "unimut.unimut:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
