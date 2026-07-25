@@ -2,7 +2,7 @@
 
 This module knows how to:
 
-  1. Find ``// unimut start`` / ``// unimut stop`` marked regions in a C
+  1. Find ``// unimut on`` / ``// unimut off`` marked regions in a C
      source file.
   2. Parse those regions with pycparser and enumerate every *statement*
      that lives directly inside a ``{ ... }`` block (a pycparser
@@ -39,19 +39,19 @@ Because pycparser's generated code does not preserve original
 formatting, applying a mutant regenerates the *entire* marked region
 (not just the mutated statement) via pycparser's ``CGenerator``. Only
 the marked region's text is touched -- everything outside
-``// unimut start`` / ``// unimut stop`` is left byte-for-byte alone.
+``// unimut on`` / ``// unimut off`` is left byte-for-byte alone.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import re
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 
 from pycparser import c_ast, c_generator, c_parser
 
-MARK_START = "// unimut start"
-MARK_STOP = "// unimut stop"
+MARK_START = "// unimut on"
+MARK_STOP = "// unimut off"
 
 EXTENSIONS = {".c"}
 
@@ -152,7 +152,7 @@ class MutationError(Exception):
 
 @dataclasses.dataclass
 class Region:
-    """A single ``// unimut start`` / ``// unimut stop`` block."""
+    """A single ``// unimut on`` / ``// unimut off`` block."""
 
     start_line: int  # 1-indexed line number of the first line of code
     end_line: int  # 1-indexed line number of the last line of code
@@ -180,7 +180,7 @@ class Mutant:
 
 
 def find_regions(source: str) -> List[Region]:
-    """Find all ``// unimut start`` / ``// unimut stop`` regions.
+    """Find all ``// unimut on`` / ``// unimut off`` regions.
 
     Marker lines are matched by their stripped content, so indentation
     around them is fine. Regions must not be nested, and every start must
@@ -213,6 +213,73 @@ def find_regions(source: str) -> List[Region]:
             f"'{MARK_STOP}'"
         )
     return regions
+
+
+def whole_file_region(source: str) -> Region:
+    """Treat the entire file as a single region, for ``--whole-file``/``--diff``.
+
+    Used instead of :func:`find_regions` when unimut is auditing a whole
+    file rather than an explicitly marked snippet. Marker comments (if any
+    are still present in the file) are left in place here -- they get
+    stripped out later as ordinary ``//`` comments during parsing, and any
+    line ranges they bracket are excluded separately by
+    :func:`find_excluded_ranges`.
+    """
+    lines = source.splitlines()
+    return Region(start_line=1, end_line=len(lines), code=source)
+
+
+def find_excluded_ranges(source: str) -> List[Tuple[int, int]]:
+    """Find marker-bracketed ranges to *exclude* from a whole-file audit.
+
+    In ``--whole-file``/``--diff`` mode the markers' meaning inverts: by
+    default every statement in the file is a mutation candidate, and a
+    ``// unimut off`` / ``// unimut on`` pair (in that order) instead
+    carves out a range that should be *skipped* -- the same markers
+    developers already use to mark an included region in the normal
+    marker-based mode, just read the other way around. This lets you keep
+    a handful of "no test can reliably trigger this" lines out of a
+    nightly audit without polluting the rest of the file.
+
+    Returns a list of inclusive ``(start_line, end_line)`` line ranges
+    (1-indexed, covering the marker comment lines themselves as well as
+    everything between them). Raises ``MutationError`` on an unmatched
+    marker, mirroring the errors :func:`find_regions` raises for the
+    non-inverted case.
+    """
+    lines = source.splitlines()
+    excluded: List[Tuple[int, int]] = []
+    stop_idx: Optional[int] = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped == MARK_STOP:
+            if stop_idx is not None:
+                raise MutationError(
+                    f"a second '{MARK_STOP}' marker at line {i + 1} was found "
+                    f"before the exclusion opened at line {stop_idx + 1} was "
+                    f"closed with '{MARK_START}'"
+                )
+            stop_idx = i
+        elif stripped == MARK_START:
+            if stop_idx is None:
+                raise MutationError(
+                    f"'{MARK_START}' marker at line {i + 1} has no preceding "
+                    f"'{MARK_STOP}' to close -- in whole-file mode, markers "
+                    f"mark an *excluded* range and must appear as "
+                    f"'{MARK_STOP}' first, then '{MARK_START}'"
+                )
+            excluded.append((stop_idx + 1, i + 1))
+            stop_idx = None
+    if stop_idx is not None:
+        raise MutationError(
+            f"'{MARK_STOP}' marker at line {stop_idx + 1} has no matching "
+            f"'{MARK_START}' to close the excluded range"
+        )
+    return excluded
+
+
+def _line_excluded(line: int, excluded_ranges: List[Tuple[int, int]]) -> bool:
+    return any(start <= line <= end for start, end in excluded_ranges)
 
 
 def _strip_calling_convention_macros(code: str) -> str:
@@ -311,7 +378,7 @@ def _parse_region(code: str) -> Tuple[c_ast.FileAST, int, int, bool]:
         raise MutationError(
             "could not parse marked region as C -- unimut's C support is "
             "heuristic and cannot handle every construct; try narrowing the "
-            f"// unimut start/stop markers ({primary})"
+            f"// unimut on/off markers ({primary})"
         ) from primary
     return wrapped_ast, preamble.count("\n") + 1, n_preamble_decls, True
 
@@ -386,14 +453,39 @@ def _make_apply(region: Region, path: Tuple[str, ...]) -> Callable[[str], str]:
     return _apply
 
 
-def generate_mutants(file_path: str, source: str) -> List[Mutant]:
+def generate_mutants(
+    file_path: str,
+    source: str,
+    *,
+    whole_file: bool = False,
+    changed_lines: Optional[Set[int]] = None,
+) -> List[Mutant]:
     """Generate every statement-removal mutant for ``source``.
 
     ``file_path`` is used only for the ``Mutant.file`` field shown in
     reports; the actual source text to mutate is ``source``.
+
+    By default (``whole_file=False``) this is the original marker-based
+    behavior: only ``// unimut on`` / ``// unimut off`` regions are
+    considered, and it is an error for none to be present.
+
+    If ``whole_file`` is True, the entire file is treated as a single
+    region (see :func:`whole_file_region`), and any marker pairs present
+    are read inverted, as *exclusions* (see :func:`find_excluded_ranges`)
+    rather than inclusions.
+
+    ``changed_lines``, if given, further restricts the result to mutants
+    whose line number is in that set -- this is how ``--diff`` is
+    implemented: the whole file is scanned, but only mutants touching
+    lines that actually changed are kept.
     """
     mutants: List[Mutant] = []
-    regions = find_regions(source)
+    if whole_file:
+        regions = [whole_file_region(source)]
+        excluded_ranges = find_excluded_ranges(source)
+    else:
+        regions = find_regions(source)
+        excluded_ranges = []
     source_lines = source.splitlines()
 
     for region in regions:
@@ -405,6 +497,8 @@ def generate_mutants(file_path: str, source: str) -> List[Mutant]:
                 continue
             region_local_line = coord_line - preamble_lines
             file_line = region.start_line + region_local_line - 1
+            if whole_file and _line_excluded(file_line, excluded_ranges):
+                continue
             if 1 <= file_line <= len(source_lines):
                 original_display = source_lines[file_line - 1].strip()
             else:
@@ -426,6 +520,8 @@ def generate_mutants(file_path: str, source: str) -> List[Mutant]:
                     _apply=_make_apply(region, path),
                 )
             )
+    if changed_lines is not None:
+        mutants = [m for m in mutants if m.line in changed_lines]
     return mutants
 
 
@@ -481,10 +577,10 @@ class TestFindRegions(unittest.TestCase):
         src = textwrap.dedent(
             """\
             int before;
-            // unimut start
+            // unimut on
             int a;
             int b;
-            // unimut stop
+            // unimut off
             int after;
             """
         )
@@ -500,13 +596,13 @@ class TestFindRegions(unittest.TestCase):
     def test_multiple_regions(self):
         src = textwrap.dedent(
             """\
-            // unimut start
+            // unimut on
             int a;
-            // unimut stop
+            // unimut off
             int mid;
-            // unimut start
+            // unimut on
             int b;
-            // unimut stop
+            // unimut off
             """
         )
         regions = find_regions(src)
@@ -516,15 +612,15 @@ class TestFindRegions(unittest.TestCase):
 
     def test_unmatched_start_raises(self):
         with self.assertRaises(MutationError):
-            find_regions("// unimut start\nint a;\n")
+            find_regions("// unimut on\nint a;\n")
 
     def test_unmatched_stop_raises(self):
         with self.assertRaises(MutationError):
-            find_regions("int a;\n// unimut stop\n")
+            find_regions("int a;\n// unimut off\n")
 
     def test_nested_start_raises(self):
         with self.assertRaises(MutationError):
-            find_regions("// unimut start\n// unimut start\nint a;\n// unimut stop\n")
+            find_regions("// unimut on\n// unimut on\nint a;\n// unimut off\n")
 
 
 class TestSimpleRemoval(unittest.TestCase):
@@ -534,10 +630,10 @@ class TestSimpleRemoval(unittest.TestCase):
     SRC = textwrap.dedent(
         """\
         int add(int a, int b) {
-          // unimut start
+          // unimut on
           int sum = a + b;
           int doubled = sum * 2;
-          // unimut stop
+          // unimut off
           return sum;
         }
         """
@@ -586,12 +682,12 @@ class TestNestedBlocks(unittest.TestCase):
     SRC = textwrap.dedent(
         """\
         int classify(int n) {
-          // unimut start
+          // unimut on
           int result = 0;
           if (n > 0) {
             result = 1;
           }
-          // unimut stop
+          // unimut off
           return result;
         }
         """
@@ -628,13 +724,13 @@ class TestRealWorldStyleSnippet(unittest.TestCase):
         /* pretend recorder function */
         static void MY_FASTCALL recff_demo(jit_State *J, RecordFFData *rd)
         {
-          // unimut start
+          // unimut on
           TRef tra = 1;  /* first ref */
           TRef trb = 2;  // second ref
           if (tra) {
             trb = tra;
           }
-          // unimut stop
+          // unimut off
         }
         """
     )
@@ -654,9 +750,85 @@ class TestRealWorldStyleSnippet(unittest.TestCase):
             self.assertEqual(lines[line - 1].strip(), original)
 
 
+class TestWholeFileMode(unittest.TestCase):
+    SRC = textwrap.dedent(
+        """\
+        int add(int a, int b) {
+          int sum = a + b;
+          int doubled = sum * 2;
+          return sum;
+        }
+
+        int mul(int a, int b) {
+          int product = a * b;
+          return product;
+        }
+        """
+    )
+
+    def test_no_markers_mutates_whole_file(self):
+        mutants = generate_mutants("both.c", self.SRC, whole_file=True)
+        originals = [m.original for m in mutants]
+        self.assertIn("int sum = a + b;", originals)
+        self.assertIn("int doubled = sum * 2;", originals)
+        self.assertIn("int product = a * b;", originals)
+
+    def test_marker_based_call_still_requires_markers(self):
+        # Old-style call, no whole_file: no markers present means no
+        # regions at all, so no mutants -- unchanged legacy behavior.
+        self.assertEqual(generate_mutants("both.c", self.SRC), [])
+
+    def test_changed_lines_filters_to_diff(self):
+        # Only line 3 ("int doubled = ...") is "changed".
+        mutants = generate_mutants(
+            "both.c", self.SRC, whole_file=True, changed_lines={3}
+        )
+        self.assertEqual(len(mutants), 1)
+        self.assertEqual(mutants[0].original, "int doubled = sum * 2;")
+
+
+class TestExcludedRanges(unittest.TestCase):
+    SRC = textwrap.dedent(
+        """\
+        int add(int a, int b) {
+          int sum = a + b;
+          // unimut off
+          int doubled = sum * 2;
+          // unimut on
+          return sum;
+        }
+        """
+    )
+
+    def test_find_excluded_ranges(self):
+        ranges = find_excluded_ranges(self.SRC)
+        self.assertEqual(ranges, [(3, 5)])
+
+    def test_excluded_line_is_not_mutated(self):
+        mutants = generate_mutants("add.c", self.SRC, whole_file=True)
+        originals = [m.original for m in mutants]
+        self.assertIn("int sum = a + b;", originals)
+        self.assertNotIn("int doubled = sum * 2;", originals)
+
+    def test_unmatched_stop_raises(self):
+        src = "int x;\n// unimut off\nint y;\n"
+        with self.assertRaises(MutationError):
+            find_excluded_ranges(src)
+
+    def test_start_without_stop_raises(self):
+        src = "int x;\n// unimut on\nint y;\n"
+        with self.assertRaises(MutationError):
+            find_excluded_ranges(src)
+
+    def test_double_stop_raises(self):
+        src = "// unimut off\nint x;\n// unimut off\nint y;\n// unimut on\n"
+        with self.assertRaises(MutationError):
+            find_excluded_ranges(src)
+
+
 class TestUnparsableRegionRaises(unittest.TestCase):
     def test_garbage_region_raises_mutation_error(self):
-        src = "// unimut start\nthis is not ) ( valid c at all {{{\n// unimut stop\n"
+        src = "// unimut on\nthis is not ) ( valid c at all {{{\n// unimut off\n"
         with self.assertRaises(MutationError):
             generate_mutants("bad.c", src)
 

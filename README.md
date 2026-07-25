@@ -1,13 +1,11 @@
 # unimut
 
-`unimut` (universal mutator) is a simple [mutation testing](https://en.wikipedia.org/wiki/Mutation_testing) tool that finds tests you are missing. It is called "universal" because it is built to work for many programming languages, and it allows you to register backends for any missing languages.
+`unimut` (universal mutator) is a [mutation testing](https://en.wikipedia.org/wiki/Mutation_testing) tool that finds tests you are missing, built to scale across a project's whole lifecycle: a fast, precise gate on individual PRs (`--diff`), an exhaustive nightly audit of legacy code (`--whole-file`), and parallel execution across CI cores (`--jobs`) -- all from one tool, working on any language with a registered backend.
 
-You temporarily mark a region of a source file with `unimut start` and `unimut stop` code comments (these should not be committed), and pass `unimut` a `--run` command that builds and tests your project. It then tries every mutation of the marked code to see which ones your test suite fails to notice.
+`unimut` tries mutations of your code and runs a `--run` command (typically "rebuild, then test") against each one:
 
-A mutant your tests catch (the `--run` command fails) is **killed** and, by
-default, not shown -- that's the good outcome. A mutant your tests don't
-catch (the `--run` command still exits 0) **survived**, and gets printed:
-that's a sign you are missing a test.
+- A mutant your tests catch (`--run` fails) is **killed** -- the good outcome, and hidden by default.
+- A mutant your tests miss (`--run` still exits 0) **survived** -- a sign you're missing a test -- and gets printed.
 
 ```diff
 $ unimut --file src/lj_ffrecord.c --run 'make -j$(nproc) && PATH="$PWD/src:$PATH" perl t/unpack.t'
@@ -21,8 +19,7 @@ src/lj_ffrecord.c:27
 Survived: 2/35
 ```
 
-Lines starting with `- ` (removed/original code) print in red, lines
-starting with `+ ` (replacement code) print in green.
+`- ` lines (removed code) print red; `+ ` lines (replacement code, for mutation kinds that have one) print green. `unimut` exits `0` if nothing survived, `1` otherwise (or on error) -- usable as a CI gate.
 
 ## Installing
 
@@ -30,141 +27,91 @@ starting with `+ ` (replacement code) print in green.
 pip install unimut
 ```
 
-or, from a checkout, for development:
+or `pip install -e .` from a checkout for development. Requires Python 3.9+; the bundled C backend pulls in [`pycparser`](https://github.com/eliben/pycparser) automatically.
 
-```
-pip install -e .
-```
+## Choosing what to mutate
 
-`unimut` requires Python 3.9+. The bundled C backend depends on
-[`pycparser`](https://github.com/eliben/pycparser), which is installed
-automatically.
+| Mode | What it mutates |
+|---|---|
+| Default | Code wrapped in `// unimut on` / `// unimut off` markers |
+| `--diff REF` | Whole file, filtered to lines that differ from `REF` |
+| `--whole-file` | Whole file, exhaustively |
 
-## Marking a region
-
-Wrap the code you want mutated in marker comments, on their own line:
+### Default: marker-based
 
 ```c
-// unimut start
+// unimut on
 static void LJ_FASTCALL recff_unpack(jit_State *J, RecordFFData *rd)
 {
   ...
 }
-// unimut stop
+// unimut off
 ```
 
-A region can be a whole function definition (as above), or just a run of
-statements/declarations the way they'd appear inside a function body:
+Wrap a whole function, or just a run of statements as they'd appear inside one. A file can hold multiple `on`/`off` pairs; they cannot be nested.
+
+### `--diff REF`: a fast PR gate
+
+```
+unimut --file src/api.c --diff main --run 'make -j$(nproc) && make test'
+```
+
+Scans the whole file, but keeps only mutants on a line `git diff REF...HEAD -- src/api.c` reports as changed. A PR only has to prove the lines it touched are covered, not the whole file -- turning an hours-long whole-codebase run into a seconds-long diff-sized one. `REF` is anything `git diff` accepts (`main`, `origin/main`, a SHA); requires `--file` to be inside a git repo with `REF` resolvable.
+
+`--diff` implies whole-file scanning, so the marker inversion below applies to it too.
+
+### `--whole-file`: a slow nightly audit
+
+```
+unimut --file src/api.c --whole-file --run 'make -j$(nproc) && make test'
+```
+
+Mutates every statement in the file -- the right mode for periodically auditing legacy code that never got markers. If `// unimut on`/`off` markers *are* still present, their meaning **inverts**: an `off`/`on` pair now marks a range to *exclude*, the same way tools like clang-format reuse on/off markers:
 
 ```c
-void foo(void) {
-  // unimut start
-  int sum = a + b;
-  int doubled = sum * 2;
-  // unimut stop
-  return sum;
-}
+// unimut off
+die("Out of memory"); // no test can reliably trigger this allocator failure
+// unimut on
 ```
 
-A single file can contain multiple `start`/`stop` pairs; regions cannot be
-nested.
+Excluded text still has to be part of a file that parses as C overall -- exclusion hides a range from *mutation*, not from parsing.
 
 ## Running it
 
 ```
-unimut --file <path> --run '<shell command>'
+unimut --file <path> --run '<shell command>' [--diff REF | --whole-file] [--jobs N]
 ```
 
-`--run` is any shell command; it's typically "rebuild, then run the
-relevant tests" (`&&`-chained, as in the example above). `unimut`:
-
-1. Reads `--file` and finds every `// unimut start` / `// unimut stop`
-   region.
-2. Dispatches to a language backend based on `--file`'s extension (`.c` ->
-   the built-in C backend). Use `--lang c` to force the C backend
-   regardless of extension -- handy when a `.c` file has been renamed to
-   something else.
-3. Backs up the original file content in a temporary directory.
-4. For every mutant: writes the mutated file to `--file`, runs `--run`,
-   records survived/killed, and restores the original file content before
-   moving on to the next mutant. The original file is always restored, even
-   if `--run` fails, unimut is interrupted, or an error occurs.
-5. Prints every surviving mutant (plus killed ones too, with
-   `--include-killed-mutants`) in the diff-like format shown above, then a
-   final `Survived: <n>/<total>` line.
-
-`unimut` exits `0` if no mutants survived, `1` if at least one did (or on
-error) -- so it's usable as a CI gate.
+`unimut` never mutates your real files. It copies the whole repository (via `git rev-parse --show-toplevel`, or the current directory if that isn't a git checkout) into an isolated temp directory per job, and mutates and builds/tests that copy instead -- your working tree is untouched even if `--run` crashes or you hit Ctrl-C.
 
 ### Options
 
 | Flag | Meaning |
 |---|---|
-| `--file PATH` | source file containing unimut markers (required) |
+| `--file PATH` | source file to mutate (required) |
 | `--run CMD` | shell command to build/test each mutant (required unless `--print-mutant-counts`) |
 | `--lang {c}` | override language detection from `--file`'s extension |
-| `--print-mutant-counts` | print how many mutants would be tried, and exit, without running anything |
-| `--include-killed-mutants` | also print killed mutants in the report, not just survivors |
+| `--diff REF` | PR-gate mode (see above) |
+| `--whole-file` | nightly-audit mode (see above) |
+| `--jobs N` | run N mutants at a time, each in its own isolated copy (default: 1) |
+| `--print-mutant-counts` | print how many mutants would be tried, and exit |
+| `--include-killed-mutants` | also print killed mutants, not just survivors |
 
 ### A note on "ignored" compile failures
 
-If a mutation makes the code fail to compile, `--run` will simply fail
-(the same as a genuine test failure), so that mutant is counted as killed
-and, by default, not shown. There's no separate "ignored" bucket to
-configure -- a mutant that doesn't compile is indistinguishable, from
-`unimut`'s point of view, from one that compiles but gets caught by a
-test, and *should* be indistinguishable: either way, nothing survived.
+A mutation that fails to compile just makes `--run` fail like any other test failure, so it's counted and treated as killed -- there's no separate "ignored" bucket. That's intentional: a mutant that doesn't compile is indistinguishable from one a test caught, and *should* be, since either way nothing survived.
 
 ## The C backend (`mutate_c`)
 
-The first version of the C backend can do one kind of mutation: **remove a
-statement**. It walks every `{ ... }` block in the marked region and, for
-each statement or declaration directly inside one, generates a mutant with
-that single statement deleted. Nested blocks are recursed into, so an
-`if (...) { ... }` can be removed as a whole *and* the statements inside it
-are each separately removable too.
+The C backend does one kind of mutation so far: **remove a statement**. It walks every `{ ... }` block and generates one mutant per statement/declaration removed, recursing into nested blocks.
 
-It's built on `pycparser`, which means it needs the marked region to
-actually parse as C. `pycparser` has no C preprocessor and no idea what
-your project's own types are called, so real-world snippets like the
-LuaJIT recorder functions this tool was written for -- full of
-project-specific types (`TRef`, `jit_State`, ...) and calling-convention
-macros (`LJ_FASTCALL`) -- won't parse as-is. `mutate_c.py` works around
-this with a best-effort, heuristic pre-pass before handing text to
-`pycparser`:
+It's built on `pycparser`, which has no preprocessor and no idea what your project's types are called. Real code (like the LuaJIT recorder functions this was built for) uses unknown types (`TRef`, `jit_State`) and calling-convention macros (`LJ_FASTCALL`) that won't parse as-is, so `mutate_c.py` does a heuristic pre-pass first: strip comments (preserving line numbers), drop bare ALL_CAPS tokens in front of `name(`, and synthesize fake `typedef int Name;` stand-ins for identifiers that look like unknown types, on top of a small `<stdint.h>`-style preamble.
 
-* `//` and `/* */` comments are stripped (replaced with matching blank
-  space, so line numbers used for reporting don't shift).
-* A bare ALL_CAPS token sitting directly in front of `name(` is assumed to
-  be a calling-convention/attribute macro and dropped.
-* Local declarations and function parameters are scanned for identifiers
-  that look like unknown types, and a `typedef int TheName;` stand-in is
-  synthesized for each, alongside a small fixed preamble of
-  `<stdint.h>`-style typedefs (`int32_t`, `size_t`, ...).
+This recovers the *statement structure* of typical C -- enough for statement removal -- but it's not a general C frontend, and treats every unknown type as `int`-sized. A region that genuinely can't be parsed this way raises a clear error rather than silently doing the wrong thing.
 
-This is enough to recover the *statement structure* of typical C, which is
-all a "remove this statement" mutator needs -- it is not a general-purpose
-C frontend, and it will not correctly resolve types for anything more
-elaborate (e.g. it treats every unknown type as if it were `int`-sized).
-If a region genuinely can't be parsed this way, `unimut` reports a clear
-error asking you to narrow the markers rather than silently doing the
-wrong thing.
+Because `pycparser`'s generator doesn't preserve formatting, applying a mutant regenerates the whole marked (or whole-file) region through `pycparser`'s `CGenerator`; everything outside it is left byte-for-byte identical.
 
-Because `pycparser`'s code generator doesn't preserve original formatting,
-applying a mutant regenerates the *entire marked region* (not just the
-mutated line) through `pycparser`'s `CGenerator`. Only text between
-`// unimut start` and `// unimut stop` is ever touched -- everything
-outside the markers is left byte-for-byte identical, and of course the
-file is restored to its original content after every mutant is tried.
-
-### Testing `mutate_c.py`
-
-`mutate_c.py` carries its own test suite, written against hardcoded
-multiline C strings baked directly into the file -- no external fixture
-files needed. Tests that check whether mutated output is still valid C
-compile it with whatever C compiler (`cc`, `gcc`, or `clang`) is found on
-`PATH`; those checks are skipped (not failed) if none is available. Run
-them with:
+Run its own test suite (hardcoded C strings, no fixture files, compiled with whatever of `cc`/`gcc`/`clang` is on `PATH`) with:
 
 ```
 python -m unittest unimut.mutate_c -v
@@ -181,21 +128,16 @@ def generate_mutants(file_path: str, source: str) -> list[Mutant]:
     ...
 ```
 
-where a `Mutant` has `.file`, `.line`, `.original`, `.mutated` (`str` or
-`None`) attributes and an `.apply(source: str) -> str` method that returns
-a full mutated copy of `source`. Register the new module in `_LANGUAGES` in
-`unimut.py`, keyed by the value you want accepted for `--lang`.
+where `Mutant` has `.file`, `.line`, `.original`, `.mutated` (`str | None`), and an `.apply(source: str) -> str` method. To support `--diff`/`--whole-file`, also accept `whole_file: bool = False` and `changed_lines: set[int] | None = None` keyword arguments (see `mutate_c.py`); backends that don't will simply refuse those flags. Register the module in `_LANGUAGES` in `unimut.py`, keyed by the `--lang` value.
 
 ## Planned
 
-* More C mutation kinds beyond statement removal (operator flips, constant
-  tweaks, condition negation) -- these are the ones that will actually
-  populate `Mutant.mutated` and print a `+` line.
+* More C mutation kinds beyond statement removal (operator flips, constant tweaks, condition negation) -- these will populate `Mutant.mutated` and print a `+` line.
 * Additional language backends.
 
 ## Contributing
 
-This project uses Black to ensure a consistent code style and Pyright for static type checking. To avoid version mismatches and CI failures, format and check your code locally using [pre-commit](https://pre-commit.com/) by running the command below once; this installs a git hook that will automatically check and format your staged files during every `git commit`.
+This project uses Black and Pyright. Run once to install a pre-commit hook that formats/checks staged files on every `git commit`:
 
 ```sh
 pip install pre-commit && pre-commit install
