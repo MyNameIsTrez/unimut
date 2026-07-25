@@ -22,8 +22,7 @@ Survived: 2/35
 ```
 
 Lines starting with `- ` (removed/original code) print in red, lines
-starting with `+ ` (replacement code) print in green, when stdout is a
-terminal.
+starting with `+ ` (replacement code) print in green.
 
 ## Installing
 
