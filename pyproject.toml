@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=68", "setuptools_scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "unimut"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Mutation testing for hand-marked regions of source files"
 readme = "README.md"
 license = { text = "MIT" }
@@ -34,3 +34,5 @@ unimut = "unimut.unimut:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools_scm]
