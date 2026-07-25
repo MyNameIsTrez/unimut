@@ -2,7 +2,7 @@
 
 `unimut` (universal mutator) is a simple [mutation testing](https://en.wikipedia.org/wiki/Mutation_testing) tool that finds tests you are missing. It is called "universal" because it is built to work for many programming languages, and it allows you to register backends for any missing languages.
 
-You temporarily mark a region of a source file with `unimut start` and `unimut stop` code comments (these should not be committed), and pass `unimut` a command that builds and tests your project. It then tries every mutation of the marked code to see which ones your test suite fails to notice.
+You temporarily mark a region of a source file with `unimut start` and `unimut stop` code comments (these should not be committed), and pass `unimut` a `--run` command that builds and tests your project. It then tries every mutation of the marked code to see which ones your test suite fails to notice.
 
 A mutant your tests catch (the `--run` command fails) is **killed** and, by
 default, not shown -- that's the good outcome. A mutant your tests don't
