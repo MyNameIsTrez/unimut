@@ -71,13 +71,14 @@ from __future__ import annotations
 
 import argparse
 import colorsys
-import concurrent.futures
 import inspect
 import itertools
 import math
 import multiprocessing
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -348,69 +349,87 @@ def _changed_lines(file_path: Path, diff_ref: str) -> Set[int]:
     return changed
 
 
-# Per-worker-process state, set up once by _init_worker and reused across
-# every mutant that worker processes -- so the (potentially large) repo
-# copy happens once per worker, not once per mutant.
-_worker_workdir: Optional[Path] = None
-_worker_target: Optional[Path] = None
+def _worker_main(
+    task_queue: "multiprocessing.Queue",
+    result_queue: "multiprocessing.Queue",
+    repo_root: str,
+    rel_path: str,
+    original_source: str,
+    run_cmd: str,
+) -> None:
+    """Entry point run in each worker process.
 
+    Ignores Ctrl-C outright (``SIGINT`` -> ignored) and puts itself in
+    its own process group (``os.setpgrp()``): Ctrl-C is handled entirely
+    by the parent process (see ``_run_mutants``), which reacts by
+    killing each worker's whole process group in one shot -- taking down
+    whatever build/test subprocess it's mid-way through along with it --
+    rather than waiting for a graceful shutdown that a long-running
+    compile would otherwise block on. Being its own process group leader
+    means that kill lands on this worker and its subprocess without also
+    hitting sibling workers, which are each leaders of their own,
+    separate groups.
 
-def _init_worker(repo_root: str, rel_path: str, workdir_registry) -> None:
-    """ProcessPoolExecutor initializer: give this worker its own repo copy.
-
-    Runs once per worker process. Copies ``repo_root`` (skipping ``.git``)
-    into a fresh temp directory and remembers where the mutated file
-    lives inside it, so later calls to :func:`_run_one_mutant` in this
-    same process don't have to.
-
-    ``workdir_registry`` is a ``multiprocessing.Manager`` list shared with
-    the parent process; the worker's temp directory is never cleaned up
-    from inside the worker itself. When a worker process exits -- whether
-    normally, killed, or crashed -- there's no reliable hook (``atexit``
-    included) that's guaranteed to run there, so the parent process
-    cleans up every directory this registry ends up holding once the
-    whole pool has shut down (see :func:`_run_mutants`).
+    Copies ``repo_root`` once into a fresh temp directory (reporting it
+    back immediately, before doing anything else, so the parent can
+    still clean it up even if this worker gets killed moments later),
+    then processes ``("baseline",)`` and ``("mutant", idx, mutant)``
+    tasks from ``task_queue`` until it sees the ``None`` sentinel.
     """
-    global _worker_workdir, _worker_target
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        os.setpgrp()
+    except (AttributeError, OSError):
+        pass  # best-effort; e.g. unavailable on non-POSIX platforms
+
     workdir = Path(tempfile.mkdtemp(prefix="unimut-worker-"))
     shutil.copytree(
         repo_root, workdir, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git")
     )
-    _worker_workdir = workdir
-    _worker_target = workdir / rel_path
-    workdir_registry.append(str(workdir))
+    result_queue.put(("workdir", str(workdir)))
+    target = workdir / rel_path
+
+    while True:
+        task = task_queue.get()
+        if task is None:
+            return
+        try:
+            if task[0] == "baseline":
+                # A worker's copy always matches original_source when it
+                # picks this up (freshly copied, or restored after any
+                # earlier mutant this same worker processed), so there's
+                # nothing to write first. Output is captured, unlike
+                # mutant runs, since a baseline failure is worth
+                # explaining to the person running unimut.
+                proc = subprocess.run(
+                    run_cmd,
+                    shell=True,
+                    cwd=workdir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                result_queue.put(("baseline", proc.returncode == 0, proc.stdout))
+            else:
+                _, idx, mutant = task
+                target.write_text(mutant.apply(original_source))
+                try:
+                    survived = _run_command(run_cmd, cwd=workdir)
+                finally:
+                    target.write_text(original_source)
+                result_queue.put(("mutant", idx, survived))
+        except Exception as exc:  # noqa: BLE001 -- reported, not raised
+            result_queue.put(("error", repr(exc)))
 
 
-def _run_one_mutant(mutant, original_source: str, run_cmd: str) -> bool:
-    """Runs inside a worker process. Returns True if the mutant survived."""
-    assert _worker_workdir is not None and _worker_target is not None
-    mutated_source = mutant.apply(original_source)
-    _worker_target.write_text(mutated_source)
+def _kill_worker_group(pid: int) -> None:
+    """Best-effort kill of a worker's whole process group (see
+    ``_worker_main``'s ``os.setpgrp()``), including whatever build/test
+    subprocess it's currently running. Fine if it's already gone."""
     try:
-        return _run_command(run_cmd, cwd=_worker_workdir)
-    finally:
-        _worker_target.write_text(original_source)
-
-
-def _run_baseline(run_cmd: str) -> Tuple[bool, str]:
-    """Runs inside a worker process: build/test the code *unmodified*.
-
-    A worker's copy already matches the original source when this runs
-    (freshly copied, or restored after any earlier mutant this same
-    worker processed), so there's nothing to write first. Captures
-    combined stdout/stderr, unlike mutant runs, since a baseline failure
-    is worth explaining to the person running unimut.
-    """
-    assert _worker_workdir is not None
-    result = subprocess.run(
-        run_cmd,
-        shell=True,
-        cwd=_worker_workdir,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    return result.returncode == 0, result.stdout
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
 
 
 def _run_mutants(
@@ -425,17 +444,16 @@ def _run_mutants(
 
     Returns ``(baseline_survived, baseline_output, results)``. The
     baseline is a single extra unit of work -- "build/test the code with
-    no mutation applied" -- submitted to the very same worker pool as the
-    mutants, so it runs *alongside* them rather than serially in front of
-    them. If it comes back failing, that means ``--run`` doesn't even
-    pass against unmodified code, so no mutant result can be trusted;
-    unimut cancels whatever mutant work hasn't started yet and returns
-    immediately with ``results`` empty, rather than finishing a run whose
-    conclusions would be meaningless.
+    no mutation applied" -- sharing the same worker pool as the mutants,
+    so it runs *alongside* them rather than serially in front of them.
+    If it comes back failing, that means ``--run`` doesn't even pass
+    against unmodified code, so no mutant result can be trusted; unimut
+    kills every worker immediately and returns with ``results`` empty,
+    rather than finishing a run whose conclusions would be meaningless.
 
     unimut never mutates ``--file`` (or anything else in the user's real
     working tree) in place. Each worker process gets its own full copy of
-    ``repo_root`` in a temp directory (see :func:`_init_worker`), mutates
+    ``repo_root`` in a temp directory (see :func:`_worker_main`), mutates
     *that* copy's version of the file, and runs ``run_cmd`` there -- so
     the original project is left untouched no matter how ``--run``
     behaves, and workers can't race each other writing to a shared file.
@@ -445,75 +463,100 @@ def _run_mutants(
     therefore holds the GIL, so threads would serialize on that step
     however many cores are idle. Separate processes don't share a GIL, so
     they actually scale with ``--jobs``.
+
+    Workers are managed by hand with :mod:`multiprocessing` rather than
+    ``concurrent.futures.ProcessPoolExecutor``: on Ctrl-C, that pool's
+    graceful, atexit-driven shutdown has to wait for every in-flight
+    build/test subprocess to finish on its own, which is exactly what
+    you're trying to escape by hitting Ctrl-C, and in the meantime each
+    worker's own default SIGINT handling raises a KeyboardInterrupt of
+    its own, producing a flood of tracebacks. Here, workers ignore
+    Ctrl-C entirely and the parent kills them outright the moment it
+    sees one (see :func:`_kill_worker_group`), so a single Ctrl-C is
+    enough.
     """
     resolved_root = repo_root.resolve()
-    rel_path = file_path.resolve().relative_to(resolved_root)
+    rel_path = str(file_path.resolve().relative_to(resolved_root))
+
+    ctx = multiprocessing.get_context("fork")
+    task_queue: "multiprocessing.Queue" = ctx.Queue()
+    result_queue: "multiprocessing.Queue" = ctx.Queue()
+
+    for idx, mutant in enumerate(mutants):
+        task_queue.put(("mutant", idx, mutant))
+    task_queue.put(("baseline",))
+    for _ in range(jobs):
+        task_queue.put(None)
+
+    workers = [
+        ctx.Process(
+            target=_worker_main,
+            args=(
+                task_queue,
+                result_queue,
+                str(resolved_root),
+                rel_path,
+                original_source,
+                run_cmd,
+            ),
+            daemon=True,
+        )
+        for _ in range(jobs)
+    ]
+    for w in workers:
+        w.start()
 
     results: List[Optional[MutantResult]] = [None] * len(mutants)
-    # Filled in by _record_baseline as soon as the baseline future
-    # completes -- checked from the mutant loop below so a failing
-    # baseline can cut the run short without waiting on it directly
-    # (which would serialize it in front of the mutants again).
-    baseline_holder: List[Optional[Tuple[bool, str]]] = [None]
+    workdirs: List[str] = []
+    baseline_survived = True
+    baseline_output = ""
+    baseline_done = False
+    completed_mutants = 0
 
-    def _record_baseline(fut: "concurrent.futures.Future[Tuple[bool, str]]") -> None:
-        baseline_holder[0] = fut.result()
+    def _cleanup(kill: bool) -> None:
+        if kill:
+            for w in workers:
+                if w.pid is not None:
+                    _kill_worker_group(w.pid)
+        for w in workers:
+            w.join(timeout=5)
+        # A queue with unflushed data can block interpreter shutdown on
+        # its own background feeder thread; we're done with both, so
+        # don't let that thread's join hold anything up.
+        task_queue.cancel_join_thread()
+        result_queue.cancel_join_thread()
+        for wd in workdirs:
+            shutil.rmtree(wd, ignore_errors=True)
 
     progress = _Progress(total=len(mutants))
     progress.start()
     try:
-        with multiprocessing.Manager() as manager:
-            workdir_registry = manager.list()
-            try:
-                with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=jobs,
-                    initializer=_init_worker,
-                    initargs=(str(resolved_root), str(rel_path), workdir_registry),
-                ) as executor:
-                    baseline_future = executor.submit(_run_baseline, run_cmd)
-                    baseline_future.add_done_callback(_record_baseline)
-
-                    mutant_futures = {
-                        executor.submit(
-                            _run_one_mutant, mutant, original_source, run_cmd
-                        ): idx
-                        for idx, mutant in enumerate(mutants)
-                    }
-                    try:
-                        for future in concurrent.futures.as_completed(mutant_futures):
-                            idx = mutant_futures[future]
-                            survived = future.result()
-                            results[idx] = MutantResult(mutants[idx], survived)
-                            progress.record(survived)
-                            baseline_result = baseline_holder[0]
-                            if baseline_result is not None and not baseline_result[0]:
-                                # No point finishing (or even starting) the
-                                # rest of the mutants: their results would
-                                # be meaningless if --run doesn't even pass
-                                # unmodified. Best-effort-cancel whatever
-                                # hasn't started yet and stop collecting.
-                                for f in mutant_futures:
-                                    f.cancel()
-                                break
-                        # The mutant loop may finish (or bail) before the
-                        # baseline does, or there may be nothing in it at
-                        # all to trigger the check above -- either way,
-                        # block here until we know the baseline's outcome.
-                        baseline_survived, baseline_output = baseline_future.result()
-                    except BaseException:
-                        executor.shutdown(wait=False, cancel_futures=True)
-                        raise
-                # All worker processes have now exited (the executor's
-                # __exit__ waits for that), so every temp directory they
-                # created is safe to remove.
-                for workdir in workdir_registry:
-                    shutil.rmtree(workdir, ignore_errors=True)
-            except BaseException:
-                for workdir in workdir_registry:
-                    shutil.rmtree(workdir, ignore_errors=True)
-                raise
-    finally:
+        while not baseline_done or completed_mutants < len(mutants):
+            kind, *payload = result_queue.get()
+            if kind == "workdir":
+                workdirs.append(payload[0])
+            elif kind == "error":
+                raise RuntimeError(f"unimut worker failed: {payload[0]}")
+            elif kind == "baseline":
+                baseline_survived, baseline_output = payload
+                baseline_done = True
+                if not baseline_survived:
+                    # No point finishing (or even starting) the rest of
+                    # the mutants: their results would be meaningless if
+                    # --run doesn't even pass unmodified.
+                    break
+            else:  # "mutant"
+                idx, survived = payload
+                results[idx] = MutantResult(mutants[idx], survived)
+                progress.record(survived)
+                completed_mutants += 1
+    except BaseException:
         progress.stop()
+        _cleanup(kill=True)
+        raise
+    else:
+        progress.stop()
+        _cleanup(kill=not baseline_survived)
 
     if not baseline_survived:
         return False, baseline_output, []
@@ -708,9 +751,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     repo_root = _git_repo_root(file_path.resolve().parent) or Path.cwd()
-    baseline_survived, baseline_output, results = _run_mutants(
-        file_path, original_source, mutants, args.run, args.jobs, repo_root
-    )
+    try:
+        baseline_survived, baseline_output, results = _run_mutants(
+            file_path, original_source, mutants, args.run, args.jobs, repo_root
+        )
+    except KeyboardInterrupt:
+        return 130
 
     if not baseline_survived:
         print(
@@ -729,4 +775,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
