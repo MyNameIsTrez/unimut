@@ -34,7 +34,6 @@ import contextlib
 import difflib
 import io
 import os
-import sys
 import tempfile
 import textwrap
 import unittest
@@ -89,7 +88,7 @@ RECFF_UNPACK_SRC = textwrap.dedent(
       }
     }
     // unimut off
-    """
+"""
 )
 
 # Captured once from an actual `unimut --file lj_ffrecord.c --run true
@@ -98,113 +97,115 @@ RECFF_UNPACK_SRC = textwrap.dedent(
 # for TRef/jit_State/RecordFFData/RecordIndex/GCtab (all unknown to
 # pycparser) and strips the LJ_FASTCALL macro on its own -- no manual
 # preamble was needed to get this function to parse.
-EXPECTED_REPORT = (
-    "lj_ffrecord.c:5\n"
-    "- TRef trtab = J->base[0];\n"
-    "\n"
-    "lj_ffrecord.c:6\n"
-    "- TRef tri = J->base[1];\n"
-    "\n"
-    "lj_ffrecord.c:7\n"
-    "- TRef trj = J->base[2];\n"
-    "\n"
-    "lj_ffrecord.c:8\n"
-    "- RecordIndex ix;\n"
-    "\n"
-    "lj_ffrecord.c:9\n"
-    "- GCtab *t;\n"
-    "\n"
-    "lj_ffrecord.c:10\n"
-    "- int32_t i, e, k;\n"
-    "\n"
-    "lj_ffrecord.c:10\n"
-    "- int32_t i, e, k;\n"
-    "\n"
-    "lj_ffrecord.c:10\n"
-    "- int32_t i, e, k;\n"
-    "\n"
-    "lj_ffrecord.c:11\n"
-    "- if (!tref_istab(trtab)) return;  /* Interpreter will throw. */\n"
-    "\n"
-    "lj_ffrecord.c:12\n"
-    "- t = tabV(&rd->argv[0]);\n"
-    "\n"
-    "lj_ffrecord.c:13\n"
-    "- if (tref_isnil(tri)) i = 1;\n"
-    "\n"
-    "lj_ffrecord.c:15\n"
-    "- i = argv2int(J, &rd->argv[1]);\n"
-    "\n"
-    "lj_ffrecord.c:16\n"
-    "- if (tref_isk(tri))\n"
-    "\n"
-    "lj_ffrecord.c:19\n"
-    "- if (!tref_isnil(trj)) {  /* trj set guarantees tri was too. */\n"
-    "\n"
-    "lj_ffrecord.c:20\n"
-    "- e = argv2int(J, &rd->argv[2]);\n"
-    "\n"
-    "lj_ffrecord.c:21\n"
-    "- if (!tref_isk(trj))\n"
-    "\n"
-    "lj_ffrecord.c:24\n"
-    "- TRef trlen = emitir(IRTI(IR_ALEN), trtab, TREF_NIL);\n"
-    "\n"
-    "lj_ffrecord.c:25\n"
-    "- e = (int32_t)lj_tab_len(t);\n"
-    "\n"
-    "lj_ffrecord.c:26\n"
-    "- emitir(IRTGI(IR_EQ), trlen, lj_ir_kint(J, e));\n"
-    "\n"
-    "lj_ffrecord.c:28\n"
-    "- if (i > e) { rd->nres = 0; return; }\n"
-    "\n"
-    "lj_ffrecord.c:28\n"
-    "- if (i > e) { rd->nres = 0; return; }\n"
-    "\n"
-    "lj_ffrecord.c:28\n"
-    "- if (i > e) { rd->nres = 0; return; }\n"
-    "\n"
-    "lj_ffrecord.c:29\n"
-    "- int32_t maxn = LJ_MAX_JSLOTS - (int32_t)J->baseslot;\n"
-    "\n"
-    "lj_ffrecord.c:30\n"
-    "- uint32_t span = (uint32_t)e - (uint32_t)i;  /* n - 1, exact and overflow-free even at INT32_MIN/MAX. */\n"
-    "\n"
-    "lj_ffrecord.c:31\n"
-    "- if (maxn <= 0 || span >= (uint32_t)maxn)\n"
-    "\n"
-    "lj_ffrecord.c:33\n"
-    "- int32_t n = (int32_t)span + 1;  /* safe: span < maxn <= LJ_MAX_JSLOTS here. */\n"
-    "\n"
-    "lj_ffrecord.c:34\n"
-    "- ix.tab = trtab; ix.idxchain = 0; ix.val = 0;\n"
-    "\n"
-    "lj_ffrecord.c:34\n"
-    "- ix.tab = trtab; ix.idxchain = 0; ix.val = 0;\n"
-    "\n"
-    "lj_ffrecord.c:34\n"
-    "- ix.tab = trtab; ix.idxchain = 0; ix.val = 0;\n"
-    "\n"
-    "lj_ffrecord.c:35\n"
-    "- settabV(J->L, &ix.tabv, t);\n"
-    "\n"
-    "lj_ffrecord.c:36\n"
-    "- rd->nres = n;\n"
-    "\n"
-    "lj_ffrecord.c:37\n"
-    "- for (k = 0; k < n; k++) {\n"
-    "\n"
-    "lj_ffrecord.c:38\n"
-    "- ix.key = lj_ir_kint(J, i + k);\n"
-    "\n"
-    "lj_ffrecord.c:39\n"
-    "- setintV(&ix.keyv, i + k);\n"
-    "\n"
-    "lj_ffrecord.c:40\n"
-    "- J->base[k] = lj_record_idx(J, &ix);\n"
-    "\n"
-    "Survived: 35/35\n"
+EXPECTED_REPORT = textwrap.dedent(
+    """\
+    lj_ffrecord.c:5
+    - TRef trtab = J->base[0];
+
+    lj_ffrecord.c:6
+    - TRef tri = J->base[1];
+
+    lj_ffrecord.c:7
+    - TRef trj = J->base[2];
+
+    lj_ffrecord.c:8
+    - RecordIndex ix;
+
+    lj_ffrecord.c:9
+    - GCtab *t;
+
+    lj_ffrecord.c:10
+    - int32_t i, e, k;
+
+    lj_ffrecord.c:10
+    - int32_t i, e, k;
+
+    lj_ffrecord.c:10
+    - int32_t i, e, k;
+
+    lj_ffrecord.c:11
+    - if (!tref_istab(trtab)) return;  /* Interpreter will throw. */
+
+    lj_ffrecord.c:12
+    - t = tabV(&rd->argv[0]);
+
+    lj_ffrecord.c:13
+    - if (tref_isnil(tri)) i = 1;
+
+    lj_ffrecord.c:15
+    - i = argv2int(J, &rd->argv[1]);
+
+    lj_ffrecord.c:16
+    - if (tref_isk(tri))
+
+    lj_ffrecord.c:19
+    - if (!tref_isnil(trj)) {  /* trj set guarantees tri was too. */
+
+    lj_ffrecord.c:20
+    - e = argv2int(J, &rd->argv[2]);
+
+    lj_ffrecord.c:21
+    - if (!tref_isk(trj))
+
+    lj_ffrecord.c:24
+    - TRef trlen = emitir(IRTI(IR_ALEN), trtab, TREF_NIL);
+
+    lj_ffrecord.c:25
+    - e = (int32_t)lj_tab_len(t);
+
+    lj_ffrecord.c:26
+    - emitir(IRTGI(IR_EQ), trlen, lj_ir_kint(J, e));
+
+    lj_ffrecord.c:28
+    - if (i > e) { rd->nres = 0; return; }
+
+    lj_ffrecord.c:28
+    - if (i > e) { rd->nres = 0; return; }
+
+    lj_ffrecord.c:28
+    - if (i > e) { rd->nres = 0; return; }
+
+    lj_ffrecord.c:29
+    - int32_t maxn = LJ_MAX_JSLOTS - (int32_t)J->baseslot;
+
+    lj_ffrecord.c:30
+    - uint32_t span = (uint32_t)e - (uint32_t)i;  /* n - 1, exact and overflow-free even at INT32_MIN/MAX. */
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+
+    lj_ffrecord.c:33
+    - int32_t n = (int32_t)span + 1;  /* safe: span < maxn <= LJ_MAX_JSLOTS here. */
+
+    lj_ffrecord.c:34
+    - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
+
+    lj_ffrecord.c:34
+    - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
+
+    lj_ffrecord.c:34
+    - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
+
+    lj_ffrecord.c:35
+    - settabV(J->L, &ix.tabv, t);
+
+    lj_ffrecord.c:36
+    - rd->nres = n;
+
+    lj_ffrecord.c:37
+    - for (k = 0; k < n; k++) {
+
+    lj_ffrecord.c:38
+    - ix.key = lj_ir_kint(J, i + k);
+
+    lj_ffrecord.c:39
+    - setintV(&ix.keyv, i + k);
+
+    lj_ffrecord.c:40
+    - J->base[k] = lj_record_idx(J, &ix);
+
+    Survived: 35/35
+    """
 )
 
 

@@ -123,7 +123,7 @@ Because `pycparser`'s generator doesn't preserve formatting, applying a mutant r
 
 Run its own test suite (hardcoded C strings, no fixture files, compiled with whatever of `cc`/`gcc`/`clang` is on `PATH`) with:
 
-```
+```sh
 python -m unittest discover -s src -p "*.py" -v
 ```
 
