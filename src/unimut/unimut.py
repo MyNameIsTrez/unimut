@@ -70,14 +70,19 @@ separate backend module. Right now that's just ``mutate_c`` for C; see
 from __future__ import annotations
 
 import argparse
+import colorsys
 import concurrent.futures
 import inspect
+import itertools
+import math
 import multiprocessing
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
@@ -137,6 +142,135 @@ class MutantResult:
     def __init__(self, mutant, survived: bool):
         self.mutant = mutant
         self.survived = survived
+
+
+# ---------------------------------------------------------------------------
+# Live progress bar: a spinner + "n/m survived" + an ETA, repainted on a
+# fixed timer while mutants run, in the same wave-colored style as unimut's
+# other animated bits. Purely cosmetic -- disabled outright when stdout
+# isn't a terminal, so piping to a file or CI log doesn't fill up with
+# carriage-return spam.
+# ---------------------------------------------------------------------------
+
+_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+_CLEAR_LINE = "\033[K"
+_CURSOR_HIDE = "\033[?25l"
+_CURSOR_SHOW = "\033[?25h"
+
+
+def _wave_text(text: str, base_hue: float, t: float) -> str:
+    """Color ``text`` character-by-character with a slowly shifting wave.
+
+    Same technique start to finish as unimut's other animated output:
+    each character's hue oscillates slightly around ``base_hue`` and its
+    brightness dips and rises, as a function of ``t`` (seconds) and the
+    character's position -- giving a gentle side-to-side shimmer as
+    successive frames are rendered.
+    """
+    if not text:
+        return text
+    chars = []
+    for i, ch in enumerate(text):
+        wave = math.sin(t * 2.0 - i * 0.1)
+        hue = (base_hue + wave * 0.03) % 1.0
+        value = 1.0 - abs(wave * 0.3)
+        r, g, b = colorsys.hsv_to_rgb(hue, 1.0, value)
+        r, g, b = int(r * 255), int(g * 255), int(b * 255)
+        chars.append(f"\033[38;2;{r};{g};{b}m{ch}")
+    return "".join(chars) + "\033[0m"
+
+
+def _format_eta(seconds: float) -> str:
+    """``90s`` -> ``1m 30s``, ``5945s`` -> ``1h 39m 5s`` -- always ends in
+    a bare (unpadded) seconds component, with any larger units it needs
+    in front of it."""
+    seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if hours or minutes:
+        parts.append(f"{minutes}m")
+    parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+class _Progress:
+    """A live ``n/m survived <ETA|spinner>`` line, repainted ~10x/second.
+
+    Examples of what gets rendered, as a run progresses::
+
+        0/1002 survived ⠋              (no ETA yet: show the spinner)
+        1/1002 survived 1h 39m 5s      (first result in: ETA takes over)
+        1000/1002 survived 34s
+
+    :meth:`record` is called from the main thread every time a mutant
+    result comes in (see ``_run_mutants``'s ``as_completed`` loop) and
+    just updates a couple of counters under a lock; a background thread
+    does the actual (re)painting on a timer, independent of how bursty
+    mutant completions are, so the spinner keeps animating smoothly even
+    while waiting on a slow compile.
+    """
+
+    def __init__(self, total: int, stream=sys.stdout, base_hue: float = 0.55):
+        self._total = total
+        self._stream = stream
+        self._base_hue = base_hue
+        self._enabled = total > 0 and hasattr(stream, "isatty") and stream.isatty()
+        self._lock = threading.Lock()
+        self._completed = 0
+        self._survived = 0
+        self._start = time.time()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if not self._enabled:
+            return
+        self._stream.write(_CURSOR_HIDE)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def record(self, survived: bool) -> None:
+        with self._lock:
+            self._completed += 1
+            if survived:
+                self._survived += 1
+
+    def stop(self) -> None:
+        if not self._enabled:
+            return
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join()
+        self._stream.write(f"\r{_CLEAR_LINE}{_CURSOR_SHOW}")
+        self._stream.flush()
+
+    def _loop(self) -> None:
+        spinner = itertools.cycle(_SPINNER_FRAMES)
+        while not self._stop_event.is_set():
+            self._paint(next(spinner))
+            self._stop_event.wait(0.1)
+
+    def _paint(self, frame: str) -> None:
+        with self._lock:
+            completed, survived = self._completed, self._survived
+        if completed == 0:
+            # No results yet to estimate a rate from -- show the spinner
+            # instead of an ETA we can't actually compute.
+            suffix = frame
+        else:
+            elapsed = time.time() - self._start
+            rate = completed / elapsed if elapsed > 0 else 0
+            remaining = max(0, self._total - completed)
+            eta_seconds = remaining / rate if rate > 0 else 0
+            suffix = _format_eta(eta_seconds)
+        message = f"{survived}/{self._total} survived {suffix}"
+        self._stream.write(
+            f"\r{_wave_text(message, self._base_hue, time.time())}{_CLEAR_LINE}"
+        )
+        self._stream.flush()
 
 
 def _run_command(run_cmd: str, cwd: Optional[Path] = None) -> bool:
@@ -325,54 +459,61 @@ def _run_mutants(
     def _record_baseline(fut: "concurrent.futures.Future[Tuple[bool, str]]") -> None:
         baseline_holder[0] = fut.result()
 
-    with multiprocessing.Manager() as manager:
-        workdir_registry = manager.list()
-        try:
-            with concurrent.futures.ProcessPoolExecutor(
-                max_workers=jobs,
-                initializer=_init_worker,
-                initargs=(str(resolved_root), str(rel_path), workdir_registry),
-            ) as executor:
-                baseline_future = executor.submit(_run_baseline, run_cmd)
-                baseline_future.add_done_callback(_record_baseline)
+    progress = _Progress(total=len(mutants))
+    progress.start()
+    try:
+        with multiprocessing.Manager() as manager:
+            workdir_registry = manager.list()
+            try:
+                with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=jobs,
+                    initializer=_init_worker,
+                    initargs=(str(resolved_root), str(rel_path), workdir_registry),
+                ) as executor:
+                    baseline_future = executor.submit(_run_baseline, run_cmd)
+                    baseline_future.add_done_callback(_record_baseline)
 
-                mutant_futures = {
-                    executor.submit(
-                        _run_one_mutant, mutant, original_source, run_cmd
-                    ): idx
-                    for idx, mutant in enumerate(mutants)
-                }
-                try:
-                    for future in concurrent.futures.as_completed(mutant_futures):
-                        idx = mutant_futures[future]
-                        results[idx] = MutantResult(mutants[idx], future.result())
-                        baseline_result = baseline_holder[0]
-                        if baseline_result is not None and not baseline_result[0]:
-                            # No point finishing (or even starting) the
-                            # rest of the mutants: their results would be
-                            # meaningless if --run doesn't even pass
-                            # unmodified. Best-effort-cancel whatever
-                            # hasn't started yet and stop collecting.
-                            for f in mutant_futures:
-                                f.cancel()
-                            break
-                    # The mutant loop may finish (or bail) before the
-                    # baseline does, or there may be nothing in it at all
-                    # to trigger the check above -- either way, block
-                    # here until we actually know the baseline's outcome.
-                    baseline_survived, baseline_output = baseline_future.result()
-                except BaseException:
-                    executor.shutdown(wait=False, cancel_futures=True)
-                    raise
-            # All worker processes have now exited (the executor's
-            # __exit__ waits for that), so every temp directory they
-            # created is safe to remove.
-            for workdir in workdir_registry:
-                shutil.rmtree(workdir, ignore_errors=True)
-        except BaseException:
-            for workdir in workdir_registry:
-                shutil.rmtree(workdir, ignore_errors=True)
-            raise
+                    mutant_futures = {
+                        executor.submit(
+                            _run_one_mutant, mutant, original_source, run_cmd
+                        ): idx
+                        for idx, mutant in enumerate(mutants)
+                    }
+                    try:
+                        for future in concurrent.futures.as_completed(mutant_futures):
+                            idx = mutant_futures[future]
+                            survived = future.result()
+                            results[idx] = MutantResult(mutants[idx], survived)
+                            progress.record(survived)
+                            baseline_result = baseline_holder[0]
+                            if baseline_result is not None and not baseline_result[0]:
+                                # No point finishing (or even starting) the
+                                # rest of the mutants: their results would
+                                # be meaningless if --run doesn't even pass
+                                # unmodified. Best-effort-cancel whatever
+                                # hasn't started yet and stop collecting.
+                                for f in mutant_futures:
+                                    f.cancel()
+                                break
+                        # The mutant loop may finish (or bail) before the
+                        # baseline does, or there may be nothing in it at
+                        # all to trigger the check above -- either way,
+                        # block here until we know the baseline's outcome.
+                        baseline_survived, baseline_output = baseline_future.result()
+                    except BaseException:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        raise
+                # All worker processes have now exited (the executor's
+                # __exit__ waits for that), so every temp directory they
+                # created is safe to remove.
+                for workdir in workdir_registry:
+                    shutil.rmtree(workdir, ignore_errors=True)
+            except BaseException:
+                for workdir in workdir_registry:
+                    shutil.rmtree(workdir, ignore_errors=True)
+                raise
+    finally:
+        progress.stop()
 
     if not baseline_survived:
         return False, baseline_output, []

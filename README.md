@@ -88,6 +88,8 @@ unimut --file <path> --run '<shell command>' [--diff REF | --whole-file] [--jobs
 
 Every run also does one baseline check: build/test the code completely unmodified, to confirm `--run` actually passes before trusting any mutant result. It's not run up front and serially -- it's just one more job in the same worker pool, so it costs no extra wall time when it passes. If it fails, mutant results would be meaningless (a broken build "survives" every mutation), so unimut cancels whatever mutants haven't started yet and reports the baseline's own output instead of the usual survivor list.
 
+While mutants run, a live `n/m survived · ETA` line updates in place (spinner included) if stdout is a terminal; piping to a file or CI log disables it and prints nothing extra.
+
 ### Options
 
 | Flag | Meaning |
