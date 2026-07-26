@@ -38,6 +38,12 @@ a statement that is nothing but a call to ``NAME`` -- e.g.
 ``--keep-call printf --keep-call assert`` stops it from reporting your
 logging and assertion calls as "untested".
 
+``--timeout SECONDS`` (default 10) bounds how long any single ``--run``
+invocation gets. A mutant that hangs past it (e.g. one that turned a
+loop infinite) is killed and silently treated as killed, same as any
+other non-surviving mutant; a baseline that times out is reported as an
+error instead, same as any other baseline failure.
+
 unimut never mutates ``--file`` in place. It always copies the whole
 repository (as reported by ``git rev-parse --show-toplevel``, or the
 current directory if that isn't a git checkout) into an isolated temp
@@ -274,16 +280,42 @@ class _Progress:
         self._stream.flush()
 
 
-def _run_command(run_cmd: str, cwd: Optional[Path] = None) -> bool:
-    """Run the user's --run command; True if it exited 0 (mutant survived)."""
-    result = subprocess.run(
+def _kill_process_group(pid: int) -> None:
+    """Best-effort kill of a process group. Fine if it's already gone."""
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _run_command(
+    run_cmd: str, cwd: Optional[Path] = None, timeout: Optional[float] = None
+) -> bool:
+    """Run the user's --run command; True if it exited 0 (mutant survived).
+
+    Runs in its own process group (``start_new_session=True``) so that on
+    a timeout, the *whole* thing -- the shell plus whatever it spawned,
+    e.g. a mutant that turned a loop infinite -- can be killed outright
+    via that group, rather than ``subprocess``'s default timeout
+    handling, which only touches the immediate shell process and would
+    leave a runaway child behind. A timeout counts as "did not survive",
+    silently, the same as any other non-zero exit.
+    """
+    proc = subprocess.Popen(
         run_cmd,
         shell=True,
         cwd=cwd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        start_new_session=True,
     )
-    return result.returncode == 0
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc.pid)
+        proc.wait()
+        return False
+    return returncode == 0
 
 
 def _git_repo_root(near: Path) -> Optional[Path]:
@@ -356,6 +388,7 @@ def _worker_main(
     rel_path: str,
     original_source: str,
     run_cmd: str,
+    timeout_seconds: float,
 ) -> None:
     """Entry point run in each worker process.
 
@@ -375,6 +408,14 @@ def _worker_main(
     still clean it up even if this worker gets killed moments later),
     then processes ``("baseline",)`` and ``("mutant", idx, mutant)``
     tasks from ``task_queue`` until it sees the ``None`` sentinel.
+
+    ``timeout_seconds`` (from ``--timeout``, already in seconds) bounds
+    how long any single ``run_cmd`` invocation gets. A mutant that
+    times out (e.g. one that turned a loop infinite) is silently treated
+    as killed -- the same as any other non-surviving mutant, no fuss.
+    The baseline is different: a baseline timeout is still a baseline
+    *failure*, reported with an error the same as a baseline that fails
+    to build, since either way no mutant result can be trusted.
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
@@ -399,37 +440,42 @@ def _worker_main(
                 # picks this up (freshly copied, or restored after any
                 # earlier mutant this same worker processed), so there's
                 # nothing to write first. Output is captured, unlike
-                # mutant runs, since a baseline failure is worth
-                # explaining to the person running unimut.
-                proc = subprocess.run(
+                # mutant runs, since a baseline failure -- including a
+                # timeout -- is worth explaining to the person running
+                # unimut. Its own process group (like _run_command) lets
+                # a timeout kill the whole thing outright, not just the
+                # immediate shell process.
+                proc = subprocess.Popen(
                     run_cmd,
                     shell=True,
                     cwd=workdir,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    start_new_session=True,
                 )
-                result_queue.put(("baseline", proc.returncode == 0, proc.stdout))
+                try:
+                    stdout, _ = proc.communicate(timeout=timeout_seconds)
+                    result_queue.put(("baseline", proc.returncode == 0, stdout))
+                except subprocess.TimeoutExpired:
+                    _kill_process_group(proc.pid)
+                    partial, _ = proc.communicate()
+                    message = f"timed out after {timeout_seconds:g}s"
+                    if partial and partial.strip():
+                        message = f"{message}\n\n{partial}"
+                    result_queue.put(("baseline", False, message))
             else:
                 _, idx, mutant = task
                 target.write_text(mutant.apply(original_source))
                 try:
-                    survived = _run_command(run_cmd, cwd=workdir)
+                    survived = _run_command(
+                        run_cmd, cwd=workdir, timeout=timeout_seconds
+                    )
                 finally:
                     target.write_text(original_source)
                 result_queue.put(("mutant", idx, survived))
         except Exception as exc:  # noqa: BLE001 -- reported, not raised
             result_queue.put(("error", repr(exc)))
-
-
-def _kill_worker_group(pid: int) -> None:
-    """Best-effort kill of a worker's whole process group (see
-    ``_worker_main``'s ``os.setpgrp()``), including whatever build/test
-    subprocess it's currently running. Fine if it's already gone."""
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        pass
 
 
 def _run_mutants(
@@ -439,6 +485,7 @@ def _run_mutants(
     run_cmd: str,
     jobs: int,
     repo_root: Path,
+    timeout_seconds: float,
 ) -> Tuple[bool, str, List[MutantResult]]:
     """Run a baseline check plus every mutant across ``jobs`` worker processes.
 
@@ -450,6 +497,10 @@ def _run_mutants(
     against unmodified code, so no mutant result can be trusted; unimut
     kills every worker immediately and returns with ``results`` empty,
     rather than finishing a run whose conclusions would be meaningless.
+
+    ``timeout_seconds`` (from ``--timeout``) is passed straight through
+    to each worker; see :func:`_worker_main` for what happens on a
+    per-mutant vs. a baseline timeout.
 
     unimut never mutates ``--file`` (or anything else in the user's real
     working tree) in place. Each worker process gets its own full copy of
@@ -472,7 +523,7 @@ def _run_mutants(
     worker's own default SIGINT handling raises a KeyboardInterrupt of
     its own, producing a flood of tracebacks. Here, workers ignore
     Ctrl-C entirely and the parent kills them outright the moment it
-    sees one (see :func:`_kill_worker_group`), so a single Ctrl-C is
+    sees one (see :func:`_kill_process_group`), so a single Ctrl-C is
     enough.
     """
     resolved_root = repo_root.resolve()
@@ -482,9 +533,9 @@ def _run_mutants(
     task_queue: "multiprocessing.Queue" = ctx.Queue()
     result_queue: "multiprocessing.Queue" = ctx.Queue()
 
+    task_queue.put(("baseline",))
     for idx, mutant in enumerate(mutants):
         task_queue.put(("mutant", idx, mutant))
-    task_queue.put(("baseline",))
     for _ in range(jobs):
         task_queue.put(None)
 
@@ -498,6 +549,7 @@ def _run_mutants(
                 rel_path,
                 original_source,
                 run_cmd,
+                timeout_seconds,
             ),
             daemon=True,
         )
@@ -517,7 +569,7 @@ def _run_mutants(
         if kill:
             for w in workers:
                 if w.pid is not None:
-                    _kill_worker_group(w.pid)
+                    _kill_process_group(w.pid)
         for w in workers:
             w.join(timeout=5)
         # A queue with unflushed data can block interpreter shutdown on
@@ -666,6 +718,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "(default: 1)"
         ),
     )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        metavar="SECONDS",
+        help=(
+            "kill any single --run invocation that takes longer than "
+            "this many seconds (catches a mutation that e.g. turns a "
+            "loop infinite). A mutant that times out is silently "
+            "treated as killed, like any other non-surviving mutant; a "
+            "baseline that times out is reported as an error, like any "
+            "other baseline failure (default: 10 -- raise this if your "
+            "own --run legitimately takes longer)"
+        ),
+    )
     return parser
 
 
@@ -674,6 +741,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.jobs < 1:
         print("unimut: error: --jobs must be at least 1", file=sys.stderr)
+        return 1
+
+    if args.timeout <= 0:
+        print(
+            "unimut: error: --timeout must be greater than 0 (seconds)", file=sys.stderr
+        )
         return 1
 
     file_path = Path(args.file)
@@ -753,9 +826,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     repo_root = _git_repo_root(file_path.resolve().parent) or Path.cwd()
     try:
         baseline_survived, baseline_output, results = _run_mutants(
-            file_path, original_source, mutants, args.run, args.jobs, repo_root
+            file_path,
+            original_source,
+            mutants,
+            args.run,
+            args.jobs,
+            repo_root,
+            args.timeout,
         )
     except KeyboardInterrupt:
+        print("\nunimut: cancelled", file=sys.stderr)
         return 130
 
     if not baseline_survived:
@@ -778,4 +858,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
+        print("\nunimut: cancelled", file=sys.stderr)
         sys.exit(130)

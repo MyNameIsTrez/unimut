@@ -86,7 +86,9 @@ unimut --file <path> --run '<shell command>' [--diff REF | --whole-file] [--jobs
 
 `--jobs N` runs N mutants at a time, each in its own worker process with its own repo copy -- not threads. Applying a mutant re-parses code with `pycparser`, which is CPU-bound pure Python and holds the GIL, so threads would mostly serialize on that step regardless of idle cores; separate processes don't share a GIL and actually scale with `--jobs`.
 
-Every run also does one baseline check: build/test the code completely unmodified, to confirm `--run` actually passes before trusting any mutant result. It's not run up front and serially -- it's just one more job in the same worker pool, so it costs no extra wall time when it passes. If it fails, mutant results would be meaningless (a broken build "survives" every mutation), so unimut cancels whatever mutants haven't started yet and reports the baseline's own output instead of the usual survivor list.
+Every run also does one baseline check: build/test the code completely unmodified, to confirm `--run` actually passes before trusting any mutant result. It's not run up front and serially -- it's just one more job in the same worker pool, so it costs no extra wall time when it passes. If it fails -- including timing out, see below -- mutant results would be meaningless (a broken build "survives" every mutation), so unimut cancels whatever mutants haven't started yet and reports the baseline's own output instead of the usual survivor list.
+
+`--timeout SECONDS` (default 10) bounds how long any single `--run` invocation gets, to catch mutations that hang -- e.g. removing a loop's increment and turning it infinite. A mutant that times out is killed (the whole process tree, not just the immediate shell) and silently treated as killed, same as any other non-surviving mutant. Raise it if your own `--run` legitimately takes longer than that (a slow test suite, a heavy build) -- and lower it if you want faster feedback on infinite-loop-style mutants and know your real runs are quick.
 
 While mutants run, a live `n/m survived · ETA` line updates in place (spinner included) if stdout is a terminal; piping to a file or CI log disables it and prints nothing extra.
 
@@ -100,6 +102,7 @@ While mutants run, a live `n/m survived · ETA` line updates in place (spinner i
 | `--diff REF` | PR-gate mode (see above) |
 | `--whole-file` | nightly-audit mode (see above) |
 | `--jobs N` | run N mutants at a time, each in its own isolated process (default: 1) |
+| `--timeout SECONDS` | kill (and silently treat as killed) any mutant whose `--run` exceeds this many seconds; a baseline timeout is an error instead (default: 10) |
 | `--keep-call NAME` | never remove a statement that's just a call to `NAME` (e.g. `--keep-call printf --keep-call assert`); repeatable |
 | `--print-mutant-counts` | print how many mutants would be tried, and exit |
 | `--include-killed-mutants` | also print killed mutants, not just survivors |
