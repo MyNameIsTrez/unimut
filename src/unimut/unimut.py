@@ -33,13 +33,34 @@ modes:
 know which statements land on changed lines), and honors the same
 marker-inverted exclusions as ``--whole-file`` if markers are present.
 
+``--keep-call NAME`` (repeatable) tells unimut never to propose removing
+a statement that is nothing but a call to ``NAME`` -- e.g.
+``--keep-call printf --keep-call assert`` stops it from reporting your
+logging and assertion calls as "untested".
+
 unimut never mutates ``--file`` in place. It always copies the whole
 repository (as reported by ``git rev-parse --show-toplevel``, or the
 current directory if that isn't a git checkout) into an isolated temp
 directory, and mutates and tests that copy instead -- so the real
-project on disk is never touched, and ``--jobs N`` (default 1) can run N
-mutants at a time, each with its own throwaway copy, without workers
-racing each other over a shared file.
+project on disk is never touched.
+
+``--jobs N`` (default 1) runs N mutants at a time, each in its own
+worker *process* with its own throwaway repository copy. This has to be
+processes rather than threads: applying a mutant reparses the region
+with pycparser, which -- like any pure-Python, CPU-bound work -- holds
+the GIL, so threads would mostly serialize on that step no matter how
+many cores are free, and building/running the actual mutant is a
+separate subprocess either way. Worker *processes* sidestep the GIL
+entirely and scale with real CPU cores.
+
+Every run also submits one extra unit of work to that same pool: a
+baseline check that builds/tests the code completely unmodified. It's
+not run serially up front -- it's just another job sharing the worker
+pool, so it costs no extra wall time in the common case where it passes.
+If it comes back failing, though, every mutant result is meaningless
+(a broken build "survives" any mutation trivially), so unimut cancels
+whatever mutant work hasn't started yet, skips the usual report, and
+exits with the baseline's captured output instead.
 
 Language support is dispatched by file extension (or ``--lang``) to a
 separate backend module. Right now that's just ``mutate_c`` for C; see
@@ -49,28 +70,31 @@ separate backend module. Right now that's just ``mutate_c`` for C; see
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import inspect
+import multiprocessing
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 from . import mutate_c
 
 # Maps a --lang value to the backend module that implements it. Each
 # backend module must expose:
 #   EXTENSIONS: set[str]                          -- recognized file extensions
-#   generate_mutants(file_path, source, *, whole_file=False, changed_lines=None)
-#       -> list[Mutant]
+#   generate_mutants(file_path, source, *, whole_file=False,
+#                     changed_lines=None, keep_calls=None) -> list[Mutant]
 # where a Mutant has .file, .line, .original, .mutated (str | None) and
-# an .apply(source) -> str method. The whole_file/changed_lines keyword
-# arguments are optional -- a backend that only supports marker-based
-# regions can omit them, and unimut will refuse --diff/--whole-file for
-# that backend with a clear error rather than silently ignoring the flag.
+# an .apply(source) -> str method that must be picklable (--jobs ships
+# mutants to worker processes). The whole_file/changed_lines/keep_calls
+# keyword arguments are optional -- a backend that only supports
+# marker-based regions can omit them, and unimut will refuse
+# --diff/--whole-file/--keep-call for that backend with a clear error
+# rather than silently ignoring the flag.
 _LANGUAGES = {
     "c": mutate_c,
 }
@@ -190,6 +214,71 @@ def _changed_lines(file_path: Path, diff_ref: str) -> Set[int]:
     return changed
 
 
+# Per-worker-process state, set up once by _init_worker and reused across
+# every mutant that worker processes -- so the (potentially large) repo
+# copy happens once per worker, not once per mutant.
+_worker_workdir: Optional[Path] = None
+_worker_target: Optional[Path] = None
+
+
+def _init_worker(repo_root: str, rel_path: str, workdir_registry) -> None:
+    """ProcessPoolExecutor initializer: give this worker its own repo copy.
+
+    Runs once per worker process. Copies ``repo_root`` (skipping ``.git``)
+    into a fresh temp directory and remembers where the mutated file
+    lives inside it, so later calls to :func:`_run_one_mutant` in this
+    same process don't have to.
+
+    ``workdir_registry`` is a ``multiprocessing.Manager`` list shared with
+    the parent process; the worker's temp directory is never cleaned up
+    from inside the worker itself. When a worker process exits -- whether
+    normally, killed, or crashed -- there's no reliable hook (``atexit``
+    included) that's guaranteed to run there, so the parent process
+    cleans up every directory this registry ends up holding once the
+    whole pool has shut down (see :func:`_run_mutants`).
+    """
+    global _worker_workdir, _worker_target
+    workdir = Path(tempfile.mkdtemp(prefix="unimut-worker-"))
+    shutil.copytree(
+        repo_root, workdir, dirs_exist_ok=True, ignore=shutil.ignore_patterns(".git")
+    )
+    _worker_workdir = workdir
+    _worker_target = workdir / rel_path
+    workdir_registry.append(str(workdir))
+
+
+def _run_one_mutant(mutant, original_source: str, run_cmd: str) -> bool:
+    """Runs inside a worker process. Returns True if the mutant survived."""
+    assert _worker_workdir is not None and _worker_target is not None
+    mutated_source = mutant.apply(original_source)
+    _worker_target.write_text(mutated_source)
+    try:
+        return _run_command(run_cmd, cwd=_worker_workdir)
+    finally:
+        _worker_target.write_text(original_source)
+
+
+def _run_baseline(run_cmd: str) -> Tuple[bool, str]:
+    """Runs inside a worker process: build/test the code *unmodified*.
+
+    A worker's copy already matches the original source when this runs
+    (freshly copied, or restored after any earlier mutant this same
+    worker processed), so there's nothing to write first. Captures
+    combined stdout/stderr, unlike mutant runs, since a baseline failure
+    is worth explaining to the person running unimut.
+    """
+    assert _worker_workdir is not None
+    result = subprocess.run(
+        run_cmd,
+        shell=True,
+        cwd=_worker_workdir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    return result.returncode == 0, result.stdout
+
+
 def _run_mutants(
     file_path: Path,
     original_source: str,
@@ -197,60 +286,97 @@ def _run_mutants(
     run_cmd: str,
     jobs: int,
     repo_root: Path,
-) -> List[MutantResult]:
-    """Run ``mutants`` across ``jobs`` worker threads (``jobs=1`` by default).
+) -> Tuple[bool, str, List[MutantResult]]:
+    """Run a baseline check plus every mutant across ``jobs`` worker processes.
+
+    Returns ``(baseline_survived, baseline_output, results)``. The
+    baseline is a single extra unit of work -- "build/test the code with
+    no mutation applied" -- submitted to the very same worker pool as the
+    mutants, so it runs *alongside* them rather than serially in front of
+    them. If it comes back failing, that means ``--run`` doesn't even
+    pass against unmodified code, so no mutant result can be trusted;
+    unimut cancels whatever mutant work hasn't started yet and returns
+    immediately with ``results`` empty, rather than finishing a run whose
+    conclusions would be meaningless.
 
     unimut never mutates ``--file`` (or anything else in the user's real
-    working tree) in place. Each worker gets its own full copy of
-    ``repo_root`` in a temp directory, mutates *that* copy's version of
-    the file, and runs ``run_cmd`` there -- so the original project is
-    left untouched no matter how ``--run`` behaves, and, above ``--jobs
-    1``, workers can't race each other writing to a shared file.
+    working tree) in place. Each worker process gets its own full copy of
+    ``repo_root`` in a temp directory (see :func:`_init_worker`), mutates
+    *that* copy's version of the file, and runs ``run_cmd`` there -- so
+    the original project is left untouched no matter how ``--run``
+    behaves, and workers can't race each other writing to a shared file.
+
+    This uses *processes*, not threads: applying a mutant re-parses the
+    marked region with pycparser, which is CPU-bound pure Python and
+    therefore holds the GIL, so threads would serialize on that step
+    however many cores are idle. Separate processes don't share a GIL, so
+    they actually scale with ``--jobs``.
     """
     resolved_root = repo_root.resolve()
     rel_path = file_path.resolve().relative_to(resolved_root)
 
     results: List[Optional[MutantResult]] = [None] * len(mutants)
-    work_queue = list(enumerate(mutants))
-    queue_lock = threading.Lock()
-    errors: List[BaseException] = []
+    # Filled in by _record_baseline as soon as the baseline future
+    # completes -- checked from the mutant loop below so a failing
+    # baseline can cut the run short without waiting on it directly
+    # (which would serialize it in front of the mutants again).
+    baseline_holder: List[Optional[Tuple[bool, str]]] = [None]
 
-    def worker() -> None:
-        workdir = Path(tempfile.mkdtemp(prefix="unimut-worker-"))
+    def _record_baseline(fut: "concurrent.futures.Future[Tuple[bool, str]]") -> None:
+        baseline_holder[0] = fut.result()
+
+    with multiprocessing.Manager() as manager:
+        workdir_registry = manager.list()
         try:
-            shutil.copytree(
-                resolved_root,
-                workdir,
-                dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns(".git"),
-            )
-            target = workdir / rel_path
-            while not errors:
-                with queue_lock:
-                    if not work_queue:
-                        return
-                    idx, mutant = work_queue.pop()
-                mutated_source = mutant.apply(original_source)
-                target.write_text(mutated_source)
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=jobs,
+                initializer=_init_worker,
+                initargs=(str(resolved_root), str(rel_path), workdir_registry),
+            ) as executor:
+                baseline_future = executor.submit(_run_baseline, run_cmd)
+                baseline_future.add_done_callback(_record_baseline)
+
+                mutant_futures = {
+                    executor.submit(
+                        _run_one_mutant, mutant, original_source, run_cmd
+                    ): idx
+                    for idx, mutant in enumerate(mutants)
+                }
                 try:
-                    survived = _run_command(run_cmd, cwd=workdir)
-                finally:
-                    target.write_text(original_source)
-                results[idx] = MutantResult(mutant, survived)
-        except BaseException as exc:  # noqa: BLE001 - propagated to the caller
-            errors.append(exc)
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+                    for future in concurrent.futures.as_completed(mutant_futures):
+                        idx = mutant_futures[future]
+                        results[idx] = MutantResult(mutants[idx], future.result())
+                        baseline_result = baseline_holder[0]
+                        if baseline_result is not None and not baseline_result[0]:
+                            # No point finishing (or even starting) the
+                            # rest of the mutants: their results would be
+                            # meaningless if --run doesn't even pass
+                            # unmodified. Best-effort-cancel whatever
+                            # hasn't started yet and stop collecting.
+                            for f in mutant_futures:
+                                f.cancel()
+                            break
+                    # The mutant loop may finish (or bail) before the
+                    # baseline does, or there may be nothing in it at all
+                    # to trigger the check above -- either way, block
+                    # here until we actually know the baseline's outcome.
+                    baseline_survived, baseline_output = baseline_future.result()
+                except BaseException:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+            # All worker processes have now exited (the executor's
+            # __exit__ waits for that), so every temp directory they
+            # created is safe to remove.
+            for workdir in workdir_registry:
+                shutil.rmtree(workdir, ignore_errors=True)
+        except BaseException:
+            for workdir in workdir_registry:
+                shutil.rmtree(workdir, ignore_errors=True)
+            raise
 
-    threads = [threading.Thread(target=worker) for _ in range(jobs)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    if errors:
-        raise errors[0]
-    return [r for r in results if r is not None]
+    if not baseline_survived:
+        return False, baseline_output, []
+    return True, "", [r for r in results if r is not None]
 
 
 def _print_report(
@@ -333,6 +459,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--keep-call",
+        metavar="NAME",
+        action="append",
+        default=None,
+        dest="keep_call",
+        help=(
+            "never propose removing a statement that is just a call to "
+            "NAME (e.g. --keep-call printf --keep-call assert), so "
+            "logging/assertion calls don't get reported as untested; "
+            "repeatable"
+        ),
+    )
+    parser.add_argument(
         "--jobs",
         type=int,
         default=1,
@@ -384,11 +523,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             )
             return 1
 
+    if args.keep_call and "keep_calls" not in generate_params:
+        print(
+            f"unimut: error: the '{args.lang or file_path.suffix}' backend does "
+            "not support --keep-call",
+            file=sys.stderr,
+        )
+        return 1
+
     generate_kwargs = {}
     if whole_file:
         generate_kwargs["whole_file"] = True
         if changed_lines is not None:
             generate_kwargs["changed_lines"] = changed_lines
+    if args.keep_call:
+        generate_kwargs["keep_calls"] = set(args.keep_call)
 
     try:
         mutants = language.generate_mutants(
@@ -418,9 +567,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     repo_root = _git_repo_root(file_path.resolve().parent) or Path.cwd()
-    results = _run_mutants(
+    baseline_survived, baseline_output, results = _run_mutants(
         file_path, original_source, mutants, args.run, args.jobs, repo_root
     )
+
+    if not baseline_survived:
+        print(
+            "unimut: error: --run failed against the unmodified code -- fix "
+            "your build/test command before running mutation tests "
+            "(mutant results would be meaningless)",
+            file=sys.stderr,
+        )
+        if baseline_output.strip():
+            print(file=sys.stderr)
+            print(baseline_output, file=sys.stderr, end="")
+        return 1
 
     color = _use_color(sys.stdout)
     return _print_report(results, args.include_killed_mutants, color)

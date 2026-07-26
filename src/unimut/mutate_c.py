@@ -434,23 +434,63 @@ def _region_source(ast: c_ast.FileAST, n_fake_decls: int, wrapped: bool) -> str:
     return gen.visit(region_ast).rstrip("\n")
 
 
-def _make_apply(region: Region, path: Tuple[str, ...]) -> Callable[[str], str]:
-    def _apply(full_source: str) -> str:
-        ast, _preamble_lines, n_fake_decls, wrapped = _parse_region(region.code)
-        _remove_by_path(ast, path)
+@dataclasses.dataclass
+class _RemoveStatementApply:
+    """Picklable ``Mutant.apply()`` implementation for statement removal.
+
+    This used to be a closure returned by a ``_make_apply(region, path)``
+    factory function, which worked fine as long as everything ran in one
+    process. ``--jobs`` runs mutants in worker *processes*, though, and
+    Python's ``pickle`` (which ``multiprocessing`` uses to ship work to
+    those processes) cannot serialize closures over local variables --
+    only module-level classes and their (picklable) field values. Hence a
+    small dataclass instead: same behavior, but it survives being pickled.
+    """
+
+    region: Region
+    path: Tuple[str, ...]
+
+    def __call__(self, full_source: str) -> str:
+        ast, _preamble_lines, n_fake_decls, wrapped = _parse_region(self.region.code)
+        _remove_by_path(ast, self.path)
         new_region_code = _region_source(ast, n_fake_decls, wrapped)
 
         lines = full_source.splitlines()
         trailing_newline = full_source.endswith("\n")
-        before = lines[: region.start_line - 1]
-        after = lines[region.end_line :]
+        before = lines[: self.region.start_line - 1]
+        after = lines[self.region.end_line :]
         result_lines = before + new_region_code.splitlines() + after
         result = "\n".join(result_lines)
         if trailing_newline:
             result += "\n"
         return result
 
-    return _apply
+
+def _make_apply(region: Region, path: Tuple[str, ...]) -> Callable[[str], str]:
+    return _RemoveStatementApply(region, path)
+
+
+def _unwrap_cast(node):
+    """Peel off Cast wrappers, e.g. ``(void)printf(...)`` -> the FuncCall."""
+    while isinstance(node, c_ast.Cast):
+        node = node.expr
+    return node
+
+
+def _call_name(node) -> Optional[str]:
+    """If ``node`` *is* (possibly cast) a call to a plain-named function,
+    return that function's name; otherwise None.
+
+    Used by ``--keep-call``/``keep_calls`` to recognize statements like
+    ``printf("%d\\n", 1 + 2);`` or ``assert(x > 0);`` that are nothing
+    but a single call -- as opposed to a call buried inside a bigger
+    statement, which statement removal would delete along with
+    everything else around it anyway.
+    """
+    node = _unwrap_cast(node)
+    if isinstance(node, c_ast.FuncCall) and isinstance(node.name, c_ast.ID):
+        return node.name.name
+    return None
 
 
 def generate_mutants(
@@ -459,6 +499,7 @@ def generate_mutants(
     *,
     whole_file: bool = False,
     changed_lines: Optional[Set[int]] = None,
+    keep_calls: Optional[Set[str]] = None,
 ) -> List[Mutant]:
     """Generate every statement-removal mutant for ``source``.
 
@@ -478,6 +519,13 @@ def generate_mutants(
     whose line number is in that set -- this is how ``--diff`` is
     implemented: the whole file is scanned, but only mutants touching
     lines that actually changed are kept.
+
+    ``keep_calls``, if given, is a set of function names; a statement
+    that is nothing but a (possibly cast) call to one of them -- e.g.
+    ``printf("%d\\n", 1 + 2);`` or ``assert(x > 0);`` -- is never offered
+    as a mutant. This is how ``--keep-call`` avoids reporting that your
+    logging or assertion calls "aren't tested" when what you actually
+    want tested is the code around them.
     """
     mutants: List[Mutant] = []
     if whole_file:
@@ -492,6 +540,8 @@ def generate_mutants(
         ast, preamble_lines, _n_fake_decls, _wrapped = _parse_region(region.code)
         for path in _find_block_item_paths(ast):
             node = _get_by_path(ast, path)
+            if keep_calls and _call_name(node) in keep_calls:
+                continue
             coord_line = node.coord.line if node.coord else None
             if coord_line is None:
                 continue
@@ -824,6 +874,72 @@ class TestExcludedRanges(unittest.TestCase):
         src = "// unimut off\nint x;\n// unimut off\nint y;\n// unimut on\n"
         with self.assertRaises(MutationError):
             find_excluded_ranges(src)
+
+
+class TestKeepCalls(unittest.TestCase):
+    SRC = textwrap.dedent(
+        """\
+        void demo(int x) {
+          // unimut on
+          printf("%d\\n", 1 + 2);
+          assert(x > 0);
+          int y = x + 1;
+          (void)printf("y=%d\\n", y);
+          // unimut off
+        }
+        """
+    )
+
+    def test_no_keep_calls_includes_everything(self):
+        mutants = generate_mutants("demo.c", self.SRC)
+        originals = [m.original for m in mutants]
+        self.assertIn('printf("%d\\n", 1 + 2);', originals)
+        self.assertIn("assert(x > 0);", originals)
+
+    def test_keep_calls_excludes_matching_statements(self):
+        mutants = generate_mutants("demo.c", self.SRC, keep_calls={"printf"})
+        originals = [m.original for m in mutants]
+        self.assertNotIn('printf("%d\\n", 1 + 2);', originals)
+        self.assertNotIn('(void)printf("y=%d\\n", y);', originals)
+        # Untouched: not a printf call.
+        self.assertIn("assert(x > 0);", originals)
+        self.assertIn("int y = x + 1;", originals)
+
+    def test_multiple_keep_calls(self):
+        mutants = generate_mutants("demo.c", self.SRC, keep_calls={"printf", "assert"})
+        originals = [m.original for m in mutants]
+        self.assertNotIn('printf("%d\\n", 1 + 2);', originals)
+        self.assertNotIn("assert(x > 0);", originals)
+        self.assertIn("int y = x + 1;", originals)
+
+    def test_unrelated_call_name_has_no_effect(self):
+        mutants_all = generate_mutants("demo.c", self.SRC)
+        mutants_filtered = generate_mutants("demo.c", self.SRC, keep_calls={"memcpy"})
+        self.assertEqual(len(mutants_all), len(mutants_filtered))
+
+
+class TestMutantsArePicklable(unittest.TestCase):
+    """--jobs ships mutants to worker processes via pickle; make sure
+    that keeps working (it broke once, when apply() was a closure)."""
+
+    def test_mutant_survives_pickle_roundtrip(self):
+        import pickle
+
+        src = textwrap.dedent(
+            """\
+            int add(int a, int b) {
+              // unimut on
+              int sum = a + b;
+              // unimut off
+              return sum;
+            }
+            """
+        )
+        mutants = generate_mutants("add.c", src)
+        self.assertEqual(len(mutants), 1)
+        roundtripped = pickle.loads(pickle.dumps(mutants[0]))
+        self.assertEqual(roundtripped.apply(src), mutants[0].apply(src))
+        self.assertNotIn("int sum", roundtripped.apply(src))
 
 
 class TestUnparsableRegionRaises(unittest.TestCase):

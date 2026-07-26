@@ -79,10 +79,14 @@ Excluded text still has to be part of a file that parses as C overall -- exclusi
 ## Running it
 
 ```
-unimut --file <path> --run '<shell command>' [--diff REF | --whole-file] [--jobs N]
+unimut --file <path> --run '<shell command>' [--diff REF | --whole-file] [--jobs N] [--keep-call NAME ...]
 ```
 
 `unimut` never mutates your real files. It copies the whole repository (via `git rev-parse --show-toplevel`, or the current directory if that isn't a git checkout) into an isolated temp directory per job, and mutates and builds/tests that copy instead -- your working tree is untouched even if `--run` crashes or you hit Ctrl-C.
+
+`--jobs N` runs N mutants at a time, each in its own worker process with its own repo copy -- not threads. Applying a mutant re-parses code with `pycparser`, which is CPU-bound pure Python and holds the GIL, so threads would mostly serialize on that step regardless of idle cores; separate processes don't share a GIL and actually scale with `--jobs`.
+
+Every run also does one baseline check: build/test the code completely unmodified, to confirm `--run` actually passes before trusting any mutant result. It's not run up front and serially -- it's just one more job in the same worker pool, so it costs no extra wall time when it passes. If it fails, mutant results would be meaningless (a broken build "survives" every mutation), so unimut cancels whatever mutants haven't started yet and reports the baseline's own output instead of the usual survivor list.
 
 ### Options
 
@@ -93,7 +97,8 @@ unimut --file <path> --run '<shell command>' [--diff REF | --whole-file] [--jobs
 | `--lang {c}` | override language detection from `--file`'s extension |
 | `--diff REF` | PR-gate mode (see above) |
 | `--whole-file` | nightly-audit mode (see above) |
-| `--jobs N` | run N mutants at a time, each in its own isolated copy (default: 1) |
+| `--jobs N` | run N mutants at a time, each in its own isolated process (default: 1) |
+| `--keep-call NAME` | never remove a statement that's just a call to `NAME` (e.g. `--keep-call printf --keep-call assert`); repeatable |
 | `--print-mutant-counts` | print how many mutants would be tried, and exit |
 | `--include-killed-mutants` | also print killed mutants, not just survivors |
 
@@ -128,7 +133,7 @@ def generate_mutants(file_path: str, source: str) -> list[Mutant]:
     ...
 ```
 
-where `Mutant` has `.file`, `.line`, `.original`, `.mutated` (`str | None`), and an `.apply(source: str) -> str` method. To support `--diff`/`--whole-file`, also accept `whole_file: bool = False` and `changed_lines: set[int] | None = None` keyword arguments (see `mutate_c.py`); backends that don't will simply refuse those flags. Register the module in `_LANGUAGES` in `unimut.py`, keyed by the `--lang` value.
+where `Mutant` has `.file`, `.line`, `.original`, `.mutated` (`str | None`), and an `.apply(source: str) -> str` method that must be picklable (`--jobs` ships mutants to worker processes -- a plain closure won't survive that; see `_RemoveStatementApply` in `mutate_c.py` for the pattern). To support `--diff`/`--whole-file`, also accept `whole_file: bool = False` and `changed_lines: set[int] | None = None`; to support `--keep-call`, accept `keep_calls: set[str] | None = None`. Backends that omit any of these simply refuse the corresponding flag. Register the module in `_LANGUAGES` in `unimut.py`, keyed by the `--lang` value.
 
 ## Planned
 
