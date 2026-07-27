@@ -116,12 +116,15 @@ EXPECTED_REPORT = textwrap.dedent(
 
     lj_ffrecord.c:10
     - int32_t i, e, k;
+    + int32_t e, k;
 
     lj_ffrecord.c:10
     - int32_t i, e, k;
+    + int32_t i, k;
 
     lj_ffrecord.c:10
     - int32_t i, e, k;
+    + int32_t i, e;
 
     lj_ffrecord.c:11
     - if (!tref_istab(trtab)) return;  /* Interpreter will throw. */
@@ -161,9 +164,11 @@ EXPECTED_REPORT = textwrap.dedent(
 
     lj_ffrecord.c:28
     - if (i > e) { rd->nres = 0; return; }
+    + if (i > e) { return; }
 
     lj_ffrecord.c:28
     - if (i > e) { rd->nres = 0; return; }
+    + if (i > e) { rd->nres = 0; }
 
     lj_ffrecord.c:29
     - int32_t maxn = LJ_MAX_JSLOTS - (int32_t)J->baseslot;
@@ -179,12 +184,15 @@ EXPECTED_REPORT = textwrap.dedent(
 
     lj_ffrecord.c:34
     - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
+    + ix.idxchain = 0; ix.val = 0;
 
     lj_ffrecord.c:34
     - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
+    + ix.tab = trtab; ix.val = 0;
 
     lj_ffrecord.c:34
     - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
+    + ix.tab = trtab; ix.idxchain = 0;
 
     lj_ffrecord.c:35
     - settabV(J->L, &ix.tabv, t);

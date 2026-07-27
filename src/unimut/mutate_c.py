@@ -44,9 +44,10 @@ the marked region's text is touched -- everything outside
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import re
-from typing import Callable, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from pycparser import c_ast, c_generator, c_parser
 
@@ -399,8 +400,8 @@ def _find_block_item_paths(node, path: Tuple[str, ...] = ()) -> List[Tuple[str, 
     return results
 
 
-def _get_by_path(root, path: Tuple[str, ...]):
-    node = root
+def _get_by_path(root: c_ast.Node, path: Tuple[str, ...]) -> c_ast.Node:
+    node: c_ast.Node = root
     for component in path:
         if "[" in component:
             attr, idx = component[:-1].split("[")
@@ -408,6 +409,12 @@ def _get_by_path(root, path: Tuple[str, ...]):
         else:
             node = getattr(node, component)
     return node
+
+
+def _node_line(node: c_ast.Node) -> Optional[int]:
+    """``node.coord.line``, or None if ``node`` has no coordinate info."""
+    coord = node.coord
+    return coord.line if coord else None
 
 
 def _remove_by_path(root, path: Tuple[str, ...]) -> None:
@@ -493,6 +500,151 @@ def _call_name(node) -> Optional[str]:
     return None
 
 
+def _is_ancestor_path(prefix: Tuple[str, ...], path: Tuple[str, ...]) -> bool:
+    return path[: len(prefix)] == prefix
+
+
+def _find_line_unit_path(
+    all_paths: List[Tuple[str, ...]],
+    line_of: Dict[Tuple[str, ...], Optional[int]],
+    target_path: Tuple[str, ...],
+) -> Tuple[str, ...]:
+    """Return the shallowest registered block-item path that is
+    ``target_path`` itself or one of its ancestors and shares its source
+    line -- i.e. the outermost statement whose regenerated text corresponds
+    to the *entire* original physical line containing the mutation.
+
+    For a plain one-statement-per-line removal this is just ``target_path``
+    itself. For something nested inside a one-line compound (the ``rd->nres
+    = 0;`` inside ``if (i > e) { rd->nres = 0; return; }``), it's the
+    enclosing ``if`` -- regenerating just the nested statement wouldn't
+    reproduce the ``if (...) { ... }`` shell the removed statement lived in.
+    """
+    target_line = line_of.get(target_path)
+    candidates = [
+        p
+        for p in all_paths
+        if line_of.get(p) == target_line and _is_ancestor_path(p, target_path)
+    ]
+    return min(candidates, key=len)
+
+
+def _decl_merge_signature(decl: c_ast.Decl):
+    """Return a hashable signature describing everything about ``decl``
+    except its declared name, or ``None`` if its structure is too complex to
+    safely fold back into a merged ``TYPE a, b;`` declarator list (a pointer
+    or array declarator, an initializer, a bitfield, or a struct/union/enum
+    type all make the per-declarator text diverge, so those are left to the
+    generic "render each survivor on its own" fallback instead).
+    """
+    if (
+        decl.init is not None
+        or decl.bitsize is not None
+        or not isinstance(decl.type, c_ast.TypeDecl)
+        or not isinstance(decl.type.type, c_ast.IdentifierType)
+    ):
+        return None
+    return (
+        tuple(decl.funcspec or ()),
+        tuple(decl.storage or ()),
+        tuple(decl.quals or ()),
+        tuple(decl.type.quals or ()),
+        tuple(decl.type.type.names),
+    )
+
+
+def _merge_decl_group(decls: List[c_ast.Decl]) -> Optional[str]:
+    """Render the surviving declarators of a multi-declarator statement
+    (e.g. the ``e, k`` left after removing ``i`` from ``int32_t i, e,
+    k;``) back into one combined declaration, or None if that's not safe
+    (see :func:`_decl_merge_signature`) -- in which case the caller falls
+    back to rendering each survivor as its own statement.
+    """
+    if not decls:
+        return None
+    sig = _decl_merge_signature(decls[0])
+    if sig is None or any(_decl_merge_signature(d) != sig for d in decls[1:]):
+        return None
+    funcspec, storage, decl_quals, type_quals, names = sig
+    prefix = "".join(s + " " for s in funcspec) + "".join(s + " " for s in storage)
+    prefix += "".join(q + " " for q in decl_quals)
+    type_str = "".join(q + " " for q in type_quals) + " ".join(names)
+    declarators = ", ".join(d.name for d in decls)
+    return f"{prefix}{type_str} {declarators};"
+
+
+def _collapse_to_one_line(text: str) -> str:
+    """Collapse pycparser's pretty-printed (possibly multi-line, indented)
+    rendering of a statement back into the single physical line it
+    originated from, turning e.g.::
+
+        if (i > e)
+        {
+          return;
+        }
+
+    into ``if (i > e) { return; }``, matching the style of the one-liner it
+    replaces in the report.
+    """
+    return " ".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+def _compute_mutated_text(
+    gen: c_generator.CGenerator,
+    ast: c_ast.FileAST,
+    all_paths: List[Tuple[str, ...]],
+    line_of: Dict[Tuple[str, ...], Optional[int]],
+    target_path: Tuple[str, ...],
+) -> Optional[str]:
+    """Compute the ``+`` replacement line for removing ``target_path``, or
+    ``None`` if removing it deletes its entire physical source line (by far
+    the common case -- most statements are alone on their own line).
+
+    A replacement is needed in two situations, both arising from more than
+    one statement sharing a single physical source line:
+
+      * ``target_path`` is one of several siblings packed onto one line --
+        either several statements (``ix.tab = trtab; ix.idxchain = 0; ...``)
+        or several declarators in one declaration (``int32_t i, e, k;``).
+        The surviving siblings are re-joined onto one line.
+      * ``target_path`` is nested inside a single-line compound statement
+        (the ``rd->nres = 0;`` inside ``if (i > e) { rd->nres = 0; return;
+        }``) -- the enclosing statement is regenerated with just that
+        nested statement removed, then collapsed back onto one line.
+    """
+    unit_path = _find_line_unit_path(all_paths, line_of, target_path)
+
+    if unit_path == target_path:
+        # Not nested inside a larger single-line statement -- but might
+        # still share its own line with siblings in the same block (a
+        # multi-declarator decl, or several statements packed onto a line).
+        parent_prefix = target_path[:-1]
+        target_line = line_of[target_path]
+        siblings = [
+            p
+            for p in all_paths
+            if p[:-1] == parent_prefix and line_of.get(p) == target_line
+        ]
+        if len(siblings) <= 1:
+            return None
+        remaining_nodes = [_get_by_path(ast, p) for p in siblings if p != target_path]
+        decl_nodes = [n for n in remaining_nodes if isinstance(n, c_ast.Decl)]
+        if len(decl_nodes) == len(remaining_nodes):
+            merged = _merge_decl_group(decl_nodes)
+            if merged is not None:
+                return merged
+        return " ".join(gen._generate_stmt(n).strip() for n in remaining_nodes)
+
+    # target_path is nested inside unit_path: regenerate just the enclosing
+    # statement with the target removed, on a private copy so the shared
+    # ``ast`` (still needed for every other mutant in this region) is
+    # untouched.
+    unit_copy = copy.deepcopy(_get_by_path(ast, unit_path))
+    relative_path = target_path[len(unit_path) :]
+    _remove_by_path(unit_copy, relative_path)
+    return _collapse_to_one_line(gen._generate_stmt(unit_copy))
+
+
 def generate_mutants(
     file_path: str,
     source: str,
@@ -538,11 +690,16 @@ def generate_mutants(
 
     for region in regions:
         ast, preamble_lines, _n_fake_decls, _wrapped = _parse_region(region.code)
-        for path in _find_block_item_paths(ast):
+        all_paths = _find_block_item_paths(ast)
+        line_of: Dict[Tuple[str, ...], Optional[int]] = {
+            p: _node_line(_get_by_path(ast, p)) for p in all_paths
+        }
+        gen = c_generator.CGenerator()
+        for path in all_paths:
             node = _get_by_path(ast, path)
             if keep_calls and _call_name(node) in keep_calls:
                 continue
-            coord_line = node.coord.line if node.coord else None
+            coord_line = line_of[path]
             if coord_line is None:
                 continue
             region_local_line = coord_line - preamble_lines
@@ -561,12 +718,13 @@ def generate_mutants(
                     if 0 <= idx < len(region_code_lines)
                     else "<unknown>"
                 )
+            mutated_display = _compute_mutated_text(gen, ast, all_paths, line_of, path)
             mutants.append(
                 Mutant(
                     file=file_path,
                     line=file_line,
                     original=original_display,
-                    mutated=None,
+                    mutated=mutated_display,
                     _apply=_make_apply(region, path),
                 )
             )
