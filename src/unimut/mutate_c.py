@@ -47,7 +47,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import re
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple, cast
 
 from pycparser import c_ast, c_generator, c_parser
 
@@ -461,7 +461,7 @@ def _get_by_path(root: c_ast.Node, path: Tuple[str, ...]) -> c_ast.Node:
 
 def _node_line(node: c_ast.Node) -> Optional[int]:
     """``node.coord.line``, or None if ``node`` has no coordinate info."""
-    coord = getattr(node, "coord", None)
+    coord = node.coord
     return coord.line if coord else None
 
 
@@ -558,6 +558,220 @@ class _RemoveStatementApply:
 
 def _make_apply(region: Region, path: Tuple[str, ...]) -> Callable[[str], str]:
     return _RemoveStatementApply(region, path)
+
+
+# The six C comparison operators, in a fixed canonical order used both for
+# iterating "the other five" variants of any one of them and for the order
+# mutants are offered in.
+_COMPARISON_OPS = ["==", "!=", "<", "<=", ">", ">="]
+
+
+def _find_comparison_ops(node):
+    """Yield every ``BinaryOp`` node under ``node`` (including ``node``
+    itself) whose operator is one of :data:`_COMPARISON_OPS`, depth-first
+    in the same order pycparser's own ``children()`` walk visits them --
+    which for ordinary code is source order."""
+    if isinstance(node, c_ast.BinaryOp) and node.op in _COMPARISON_OPS:
+        yield node
+    for _name, child in node.children():
+        yield from _find_comparison_ops(child)
+
+
+def _find_node_path(
+    root, target, path: Tuple[str, ...] = ()
+) -> Optional[Tuple[str, ...]]:
+    """Return the path from ``root`` down to ``target`` (matched by
+    identity), in the same ``name``/``name[idx]`` encoding
+    :func:`_get_by_path` understands -- or ``None`` if ``target`` isn't
+    reachable from ``root``.
+
+    Unlike :func:`_find_block_item_paths`, this locates a path to *any*
+    node, not just statement-removal candidates -- operator mutation
+    needs to reach a comparison buried arbitrarily deep inside an
+    expression (an ``if``'s condition, one side of a ``||``, ...), not
+    just a statement sitting directly in a block.
+    """
+    for name, child in root.children():
+        child_path = path + (name,)
+        if child is target:
+            return child_path
+        found = _find_node_path(child, target, child_path)
+        if found is not None:
+            return found
+    return None
+
+
+def _control_body(node: c_ast.Node):
+    """Return the single body statement of an ``if``/``while``/``for``/
+    ``do`` node, or ``None`` if ``node`` isn't one of those."""
+    if isinstance(node, c_ast.If):
+        return node.iftrue
+    if isinstance(node, (c_ast.While, c_ast.For, c_ast.DoWhile)):
+        return node.stmt
+    return None
+
+
+def _header_spans_whole_statement(node: c_ast.Node, target_line: int) -> bool:
+    """True if regenerating the *entire* control statement ``node`` (header
+    and body alike), then collapsing it to one line, faithfully reproduces
+    ``target_line`` -- i.e. the whole thing (not just the header) already
+    lives on that one physical source line, the way ``if (i > e) { rd->nres
+    = 0; return; }`` does.
+
+    False means the body spills onto other lines (a bare unbraced body on
+    the next line, or a compound body whose contents start on later
+    lines) -- e.g. ``for (k = 0; k < n; k++) {`` followed by a
+    multi-statement loop body. In that case an operator mutated inside the
+    header must be rendered as *just* the header (see
+    :func:`_operator_header_text`), never by dragging the whole
+    (unrelated, unmutated) body along with it.
+    """
+    body = _control_body(node)
+    if body is None:
+        return True
+    if isinstance(body, c_ast.Compound):
+        items = body.block_items or []
+        if not items:
+            return _node_line(body) == target_line
+        return _node_line(body) == target_line and all(
+            _node_line(item) == target_line for item in items
+        )
+    return _node_line(body) == target_line
+
+
+def _operator_header_text(
+    gen: c_generator.CGenerator, mutated_node: c_ast.Node, target_line: int
+) -> str:
+    """Render just the header of a control statement (``mutated_node``, a
+    deep copy with the operator already swapped inside it) -- condition
+    (and, for ``for``, init/next) only, never the body -- appending the
+    body's opening ``{`` if and only if that brace itself sits on
+    ``target_line`` in the original, matching how the unmutated header
+    line already looks (see :func:`_header_spans_whole_statement` for why
+    the body's *contents* are never included here).
+    """
+    if isinstance(mutated_node, c_ast.If):
+        cond = gen.visit(mutated_node.cond) if mutated_node.cond is not None else ""
+        text = f"if ({cond})"
+    elif isinstance(mutated_node, c_ast.While):
+        cond = gen.visit(mutated_node.cond) if mutated_node.cond is not None else ""
+        text = f"while ({cond})"
+    elif isinstance(mutated_node, c_ast.For):
+        init = gen.visit(mutated_node.init) if mutated_node.init is not None else ""
+        cond = gen.visit(mutated_node.cond) if mutated_node.cond is not None else ""
+        nxt = gen.visit(mutated_node.next) if mutated_node.next is not None else ""
+        text = f"for ({init}; {cond}; {nxt})"
+    else:
+        assert isinstance(mutated_node, c_ast.DoWhile)
+        # The condition of a do/while sits at the *end* of the statement,
+        # so it can only ever share a line with the header in the
+        # all-on-one-line case already handled by
+        # _header_spans_whole_statement -- this branch is just a safe
+        # fallback and shouldn't normally be reached.
+        return "do"
+
+    body = _control_body(mutated_node)
+    if isinstance(body, c_ast.Compound) and _node_line(body) == target_line:
+        text += " {"
+    return text
+
+
+def _find_enclosing_statement_path(
+    all_paths: List[Tuple[str, ...]],
+    line_of: Dict[Tuple[str, ...], Optional[int]],
+    target_path: Tuple[str, ...],
+    target_line: Optional[int],
+) -> Tuple[str, ...]:
+    """Return the shallowest registered statement candidate (from
+    ``all_paths``, the same list statement removal uses) that is an
+    ancestor of ``target_path`` and, preferably, shares its physical
+    source line -- i.e. the statement whose regenerated text corresponds
+    to the whole line ``target_path`` lives on. Falls back to the closest
+    enclosing candidate regardless of line if none shares it (e.g. a
+    condition wrapped across several physical lines), and to ``()``
+    (meaning "the whole region") if ``target_path`` has no registered
+    statement ancestor at all.
+    """
+    candidates = [
+        p
+        for p in all_paths
+        if line_of.get(p) == target_line and _is_ancestor_path(p, target_path)
+    ]
+    if candidates:
+        return min(candidates, key=len)
+    ancestor_candidates = [p for p in all_paths if _is_ancestor_path(p, target_path)]
+    return max(ancestor_candidates, key=len) if ancestor_candidates else ()
+
+
+def _compute_operator_mutated_text(
+    gen: c_generator.CGenerator,
+    ast: c_ast.FileAST,
+    all_paths: List[Tuple[str, ...]],
+    line_of: Dict[Tuple[str, ...], Optional[int]],
+    op_path: Tuple[str, ...],
+    new_op: str,
+) -> str:
+    """Build the ``+`` replacement line for swapping the comparison
+    operator at ``op_path`` to ``new_op``.
+
+    Finds the shallowest known statement candidate (from ``all_paths``,
+    the same list statement removal uses) that both contains this
+    comparison and shares its physical source line -- the statement whose
+    regenerated text corresponds to the whole line the comparison lives
+    on. If that statement is an ``if``/``while``/``for``/``do`` whose body
+    spills past this one line, only the header is rendered (see
+    :func:`_operator_header_text`); otherwise the whole statement is
+    regenerated on a private copy and collapsed back onto one line, the
+    same way nested statement-removal replacements are (see
+    :func:`_compute_mutated_text`).
+    """
+    target_line = _node_line(_get_by_path(ast, op_path))
+    assert target_line is not None, "a comparison node always has a source location"
+    unit_path = _find_enclosing_statement_path(all_paths, line_of, op_path, target_line)
+    unit_node = _get_by_path(ast, unit_path) if unit_path else ast
+
+    unit_copy = copy.deepcopy(unit_node)
+    relative_path = op_path[len(unit_path) :]
+    target_in_copy = cast(c_ast.BinaryOp, _get_by_path(unit_copy, relative_path))
+    target_in_copy.op = new_op
+
+    if isinstance(
+        unit_node, (c_ast.If, c_ast.While, c_ast.For, c_ast.DoWhile)
+    ) and not _header_spans_whole_statement(unit_node, target_line):
+        return _operator_header_text(gen, unit_copy, target_line)
+    return _collapse_to_one_line(gen._generate_stmt(unit_copy))
+
+
+@dataclasses.dataclass
+class _ReplaceOperatorApply:
+    """Picklable ``Mutant.apply()`` implementation for swapping a
+    comparison operator, mirroring :class:`_RemoveStatementApply`: each
+    call re-parses the region from scratch (so it starts from a fresh,
+    unmutated AST -- important since this same region is shared across
+    every mutant of it, and worker processes get their own copy via
+    pickle anyway), locates the target ``BinaryOp`` by its structural
+    path, flips its ``.op``, and regenerates the region.
+    """
+
+    region: Region
+    path: Tuple[str, ...]
+    new_op: str
+
+    def __call__(self, full_source: str) -> str:
+        ast, _preamble_lines, n_fake_decls, wrapped = _parse_region(self.region.code)
+        node = cast(c_ast.BinaryOp, _get_by_path(ast, self.path))
+        node.op = self.new_op
+        new_region_code = _region_source(ast, n_fake_decls, wrapped)
+
+        lines = full_source.splitlines()
+        trailing_newline = full_source.endswith("\n")
+        before = lines[: self.region.start_line - 1]
+        after = lines[self.region.end_line :]
+        result_lines = before + new_region_code.splitlines() + after
+        result = "\n".join(result_lines)
+        if trailing_newline:
+            result += "\n"
+        return result
 
 
 def _unwrap_cast(node):
@@ -807,6 +1021,31 @@ def _compute_mutated_text(
     return _collapse_to_one_line(gen._generate_stmt(unit_copy))
 
 
+def _original_display(
+    region: Region,
+    source_lines: List[str],
+    region_local_line: int,
+    file_line: int,
+) -> str:
+    """Return the ``-`` display text for a mutant at ``file_line``: the
+    real source file's own text for that line, verbatim (stripped),
+    shared by both statement-removal and operator-mutation mutants since
+    neither ever changes what counts as the "original" line -- only what
+    replaces it.
+    """
+    if 1 <= file_line <= len(source_lines):
+        return source_lines[file_line - 1].strip()
+    # Should not normally happen, but fall back to the region's own
+    # (marker-relative) text rather than crashing.
+    region_code_lines = region.code.splitlines()
+    idx = region_local_line - 1
+    return (
+        region_code_lines[idx].strip()
+        if 0 <= idx < len(region_code_lines)
+        else "<unknown>"
+    )
+
+
 def generate_mutants(
     file_path: str,
     source: str,
@@ -815,7 +1054,15 @@ def generate_mutants(
     changed_lines: Optional[Set[int]] = None,
     keep_calls: Optional[Set[str]] = None,
 ) -> List[Mutant]:
-    """Generate every statement-removal mutant for ``source``.
+    """Generate every statement-removal and comparison-operator mutant for
+    ``source``.
+
+    Alongside removing each statement, this also finds every ``==``,
+    ``!=``, ``<``, ``<=``, ``>``, and ``>=`` comparison anywhere in a
+    region (not just ones sitting directly in a block -- inside an
+    ``if``/``while``/``for`` condition counts too) and offers the other
+    five operators as separate mutants, each showing the enclosing
+    physical line with just that one operator swapped.
 
     ``file_path`` is used only for the ``Mutant.file`` field shown in
     reports; the actual source text to mutate is ``source``.
@@ -868,18 +1115,9 @@ def generate_mutants(
             file_line = region.start_line + region_local_line - 1
             if whole_file and _line_excluded(file_line, excluded_ranges):
                 continue
-            if 1 <= file_line <= len(source_lines):
-                original_display = source_lines[file_line - 1].strip()
-            else:
-                # Should not normally happen, but fall back to the
-                # regenerated text rather than crashing.
-                region_code_lines = region.code.splitlines()
-                idx = region_local_line - 1
-                original_display = (
-                    region_code_lines[idx].strip()
-                    if 0 <= idx < len(region_code_lines)
-                    else "<unknown>"
-                )
+            original_display = _original_display(
+                region, source_lines, region_local_line, file_line
+            )
             mutated_display = _compute_mutated_text(gen, ast, all_paths, line_of, path)
             mutants.append(
                 Mutant(
@@ -890,6 +1128,48 @@ def generate_mutants(
                     _apply=_make_apply(region, path),
                 )
             )
+
+        for cmp_node in _find_comparison_ops(ast):
+            op_path = _find_node_path(ast, cmp_node)
+            if op_path is None:
+                continue
+            coord_line = _node_line(cmp_node)
+            if coord_line is None:
+                continue
+            if keep_calls:
+                enclosing_path = _find_enclosing_statement_path(
+                    all_paths, line_of, op_path, coord_line
+                )
+                enclosing_node = (
+                    _get_by_path(ast, enclosing_path) if enclosing_path else None
+                )
+                if (
+                    enclosing_node is not None
+                    and _call_name(enclosing_node) in keep_calls
+                ):
+                    continue
+            region_local_line = coord_line - preamble_lines
+            file_line = region.start_line + region_local_line - 1
+            if whole_file and _line_excluded(file_line, excluded_ranges):
+                continue
+            original_display = _original_display(
+                region, source_lines, region_local_line, file_line
+            )
+            for new_op in _COMPARISON_OPS:
+                if new_op == cmp_node.op:
+                    continue
+                mutated_display = _compute_operator_mutated_text(
+                    gen, ast, all_paths, line_of, op_path, new_op
+                )
+                mutants.append(
+                    Mutant(
+                        file=file_path,
+                        line=file_line,
+                        original=original_display,
+                        mutated=mutated_display,
+                        _apply=_ReplaceOperatorApply(region, op_path, new_op),
+                    )
+                )
     if changed_lines is not None:
         mutants = [m for m in mutants if m.line in changed_lines]
     return mutants
@@ -1491,6 +1771,216 @@ class TestMutantsArePicklable(unittest.TestCase):
         roundtripped = pickle.loads(pickle.dumps(mutants[0]))
         self.assertEqual(roundtripped.apply(src), mutants[0].apply(src))
         self.assertNotIn("int sum", roundtripped.apply(src))
+
+
+class TestComparisonOperatorMutation(unittest.TestCase):
+    """Every one of the 6 comparison operators must mutate into exactly
+    the other 5 -- never itself, never anything else."""
+
+    _ALL_OPS = ["==", "!=", "<", "<=", ">", ">="]
+
+    def _src_for(self, op: str) -> str:
+        return textwrap.dedent(
+            f"""\
+            int cmp(int a, int b) {{
+              // unimut on
+              if (a {op} b) return 1;
+              return 0;
+              // unimut off
+            }}
+            """
+        )
+
+    def _operator_mutants(self, op: str):
+        src = self._src_for(op)
+        mutants = generate_mutants("cmp.c", src)
+        # Only the operator-swap mutants -- distinguished from the
+        # statement-removal mutants generate_mutants also produces for
+        # this snippet (including a same-line "remove the return"
+        # variant that, unmutated itself, can otherwise look identical
+        # to an operator mutant purely by coincidence of text).
+        return src, [m for m in mutants if isinstance(m._apply, _ReplaceOperatorApply)]
+
+    def test_each_operator_produces_the_other_five(self):
+        for op in self._ALL_OPS:
+            with self.subTest(op=op):
+                _src, op_mutants = self._operator_mutants(op)
+                variants = [m.mutated for m in op_mutants]
+                expected = [
+                    f"if (a {other} b) return 1;"
+                    for other in self._ALL_OPS
+                    if other != op
+                ]
+                self.assertCountEqual(variants, expected)
+
+    def test_original_operator_never_reoffered(self):
+        for op in self._ALL_OPS:
+            with self.subTest(op=op):
+                _src, op_mutants = self._operator_mutants(op)
+                self.assertNotIn(
+                    f"if (a {op} b) return 1;", [m.mutated for m in op_mutants]
+                )
+
+    def test_apply_swaps_only_the_operator(self):
+        for op in self._ALL_OPS:
+            for other in self._ALL_OPS:
+                if other == op:
+                    continue
+                with self.subTest(op=op, other=other):
+                    src, op_mutants = self._operator_mutants(op)
+                    mutant = next(
+                        m
+                        for m in op_mutants
+                        if m.mutated == f"if (a {other} b) return 1;"
+                    )
+                    mutated_source = mutant.apply(src)
+                    self.assertIn(f"if (a {other} b)", mutated_source)
+                    self.assertNotIn(f"if (a {op} b)", mutated_source)
+                    if _CC:
+                        self.assertTrue(_compiles(mutated_source))
+
+    def test_sibling_mutants_apply_independently(self):
+        # Each of the 5 sibling mutants for one comparison must be
+        # derived from a fresh parse of the *original* source rather than
+        # some shared, progressively-mutated AST: calling apply() twice
+        # on the same mutant must give the same result both times, and
+        # different siblings must give different results from each
+        # other -- neither should depend on what order they're called in.
+        src = self._src_for("<")
+        _src, op_mutants = self._operator_mutants("<")
+        results = [(m.mutated, m.apply(src)) for m in op_mutants]
+        for mutated, first_result in results:
+            mutant = next(m for m in op_mutants if m.mutated == mutated)
+            self.assertEqual(mutant.apply(src), first_result)
+        distinct_outputs = {result for _mutated, result in results}
+        self.assertEqual(len(distinct_outputs), len(op_mutants))
+
+
+class TestComparisonOperatorNestedInExpression(unittest.TestCase):
+    """A comparison doesn't have to sit directly in a block to be found
+    -- one buried inside a `||`/`&&`, or inside a loop header, counts
+    too."""
+
+    SRC = textwrap.dedent(
+        """\
+        int f(int a, int b, int c, int d) {
+          // unimut on
+          if (a > b || c < d) {
+            return 1;
+          }
+          return 0;
+          // unimut off
+        }
+        """
+    )
+
+    def test_both_comparisons_found(self):
+        mutants = generate_mutants("nested.c", self.SRC)
+        op_mutants = [m for m in mutants if isinstance(m._apply, _ReplaceOperatorApply)]
+        # 5 variants each for "a > b" and "c < d" -- 10 total.
+        self.assertEqual(len(op_mutants), 10)
+        variants = {m.mutated for m in op_mutants}
+        self.assertIn("if ((a == b) || (c < d)) {", variants)
+        self.assertIn("if ((a > b) || (c == d)) {", variants)
+
+    def test_mutants_compile(self):
+        mutants = generate_mutants("nested.c", self.SRC)
+        op_mutants = [m for m in mutants if isinstance(m._apply, _ReplaceOperatorApply)]
+        if _CC:
+            for m in op_mutants:
+                with self.subTest(mutated=m.mutated):
+                    self.assertTrue(_compiles(m.apply(self.SRC)))
+
+
+class TestComparisonOperatorHeaderOnly(unittest.TestCase):
+    """When a comparison lives in a control-structure header whose body
+    spills past that one physical line, the replacement must show only
+    the header -- never the (unrelated, unmutated) body dragged along."""
+
+    SRC = textwrap.dedent(
+        """\
+        int sum_below(int n) {
+          int total = 0;
+          int k;
+          // unimut on
+          for (k = 0; k < n; k++) {
+            total = total + k;
+            total = total + 1;
+          }
+          // unimut off
+          return total;
+        }
+        """
+    )
+
+    def test_header_only_no_body_leakage(self):
+        mutants = generate_mutants("loop.c", self.SRC)
+        op_mutants = [m for m in mutants if m.mutated == "for (k = 0; k <= n; k++) {"]
+        self.assertEqual(len(op_mutants), 1)
+        mutated = op_mutants[0].mutated
+        assert mutated is not None
+        self.assertNotIn("total", mutated)
+
+    def test_apply_only_touches_the_condition(self):
+        mutants = generate_mutants("loop.c", self.SRC)
+        mutant = next(m for m in mutants if m.mutated == "for (k = 0; k <= n; k++) {")
+        mutated_source = mutant.apply(self.SRC)
+        self.assertIn("k <= n", mutated_source)
+        self.assertIn("total = total + k;", mutated_source)
+        self.assertIn("total = total + 1;", mutated_source)
+        if _CC:
+            self.assertTrue(_compiles(mutated_source))
+
+
+class TestComparisonOperatorKeepCalls(unittest.TestCase):
+    """--keep-call must exempt comparisons inside a kept call's own
+    statement, the same way it already exempts that statement from
+    removal."""
+
+    SRC = textwrap.dedent(
+        """\
+        void demo(int x) {
+          // unimut on
+          assert(x > 0);
+          int y = x + 1;
+          // unimut off
+        }
+        """
+    )
+
+    def test_no_keep_calls_mutates_the_comparison(self):
+        mutants = generate_mutants("demo.c", self.SRC)
+        op_mutants = [m for m in mutants if isinstance(m._apply, _ReplaceOperatorApply)]
+        self.assertEqual(len(op_mutants), 5)
+
+    def test_keep_calls_excludes_the_comparison_too(self):
+        mutants = generate_mutants("demo.c", self.SRC, keep_calls={"assert"})
+        op_mutants = [m for m in mutants if isinstance(m._apply, _ReplaceOperatorApply)]
+        self.assertEqual(op_mutants, [])
+
+
+class TestOperatorMutantsArePicklable(unittest.TestCase):
+    """--jobs ships mutants to worker processes via pickle; operator
+    mutants need to survive that roundtrip just as removal mutants do."""
+
+    def test_operator_mutant_survives_pickle_roundtrip(self):
+        import pickle
+
+        src = textwrap.dedent(
+            """\
+            int cmp(int a, int b) {
+              // unimut on
+              if (a < b) return 1;
+              return 0;
+              // unimut off
+            }
+            """
+        )
+        mutants = generate_mutants("cmp.c", src)
+        op_mutant = next(m for m in mutants if m.mutated == "if (a >= b) return 1;")
+        roundtripped = pickle.loads(pickle.dumps(op_mutant))
+        self.assertEqual(roundtripped.apply(src), op_mutant.apply(src))
+        self.assertIn("a >= b", roundtripped.apply(src))
 
 
 class TestUnparsableRegionRaises(unittest.TestCase):

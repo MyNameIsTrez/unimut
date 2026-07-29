@@ -113,7 +113,7 @@ A mutation that fails to compile just makes `--run` fail like any other test fai
 
 ## The C backend (`mutate_c`)
 
-The C backend does one kind of mutation so far: **remove a statement**. It's built on `pycparser`, which has no preprocessor and no idea what your project's types are called. Real code (like the LuaJIT recorder functions this was built for) uses unknown types (`TRef`, `jit_State`) and calling-convention macros (`LJ_FASTCALL`) that won't parse as-is, so `mutate_c.py` does a heuristic pre-pass first: strip comments (preserving line numbers), drop bare ALL_CAPS tokens in front of `name(`, and synthesize fake `typedef int Name;` stand-ins for identifiers that look like unknown types, on top of a small `<stdint.h>`-style preamble.
+It's built on `pycparser`, which has no preprocessor and no idea what your project's types are called. Real code (like the LuaJIT recorder functions this was built for) uses unknown types (`TRef`, `jit_State`) and calling-convention macros (`LJ_FASTCALL`) that won't parse as-is, so `mutate_c.py` does a heuristic pre-pass first: strip comments (preserving line numbers), drop bare ALL_CAPS tokens in front of `name(`, and synthesize fake `typedef int Name;` stand-ins for identifiers that look like unknown types, on top of a small `<stdint.h>`-style preamble.
 
 This recovers the *statement structure* of typical C -- enough for statement removal -- but it's not a general C frontend, and treats every unknown type as `int`-sized. A region that genuinely can't be parsed this way raises a clear error rather than silently doing the wrong thing.
 

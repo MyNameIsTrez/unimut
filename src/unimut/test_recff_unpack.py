@@ -13,11 +13,14 @@ unimut generates for this function, not just survivors. ``--run true``
 is a trivial always-succeeding command; it doesn't try to validate any
 real LuaJIT semantics, it exists purely so every generated mutant
 "survives" and therefore is guaranteed to show up in the report. That
-turns the report into a plain enumeration of the 44 statement-removal
-candidates unimut finds in this function -- the exact reference count
-from the README's own ``recff_unpack`` example (``Survived: 2/44``,
-there run against a real test suite) -- which is what gets diffed
-against ``EXPECTED_REPORT`` below.
+turns the report into a plain enumeration of every mutant unimut finds
+in this function: the 44 statement-removal candidates -- the same count
+as the README's own ``recff_unpack`` example (``Survived: 2/44``, there
+run against a real test suite, before operator mutation existed) -- plus
+20 more from swapping each of this function's four comparisons
+(``i > e``, ``maxn <= 0``, ``span >= (uint32_t)maxn``, ``k < n``) into
+each of the other five comparison operators, for 64 total. Which is what
+gets diffed against ``EXPECTED_REPORT`` below.
 
 If a future change to ``mutate_c``'s parsing heuristics or statement
 walk ever adds, drops, or reorders a candidate for this real-world
@@ -108,6 +111,23 @@ RECFF_UNPACK_SRC = textwrap.dedent(
 # 13 and 19) also get a third variant each: collapsing the whole `if`
 # statement down to just its `else` content, executed unconditionally
 # (`+ { i = argv2int(...); ... }` at line 13, and similarly at line 19).
+#
+# On top of statement removal, every `==`/`!=`/`<`/`<=`/`>`/`>=` comparison
+# anywhere in the function -- including ones buried in an `if`/`for`
+# condition rather than sitting in a block on their own -- gets five
+# extra mutants, one per remaining operator. Four such comparisons exist
+# here: `i > e` (line 28, its enclosing `if (...) { ... }` is all on one
+# line, so each variant re-shows the whole thing); `maxn <= 0` and `span
+# >= (uint32_t)maxn` (both on line 31, an unbraced `if` whose body is on
+# the *next* line, so each variant shows only the header -- reconstructed
+# from the condition's own AST, hence the extra parens pycparser's
+# generator always adds around `||`/comparison subexpressions -- never
+# the untouched `lj_trace_err_info(...)` body); and `k < n` (line 37, a
+# `for` whose braced body spans many further lines, so each variant is
+# again header-only, with the trailing ` {` kept since that brace really
+# does sit on line 37 in the original). These four appear, in that order,
+# as a second pass after every statement-removal mutant -- hence they're
+# grouped at the end below rather than interleaved by line.
 EXPECTED_REPORT = textwrap.dedent(
     """\
     lj_ffrecord.c:5
@@ -257,7 +277,87 @@ EXPECTED_REPORT = textwrap.dedent(
     lj_ffrecord.c:40
     - J->base[k] = lj_record_idx(J, &ix);
 
-    Survived: 44/44
+    lj_ffrecord.c:28
+    - if (i > e) { rd->nres = 0; return; }
+    + if (i == e) { rd->nres = 0; return; }
+
+    lj_ffrecord.c:28
+    - if (i > e) { rd->nres = 0; return; }
+    + if (i != e) { rd->nres = 0; return; }
+
+    lj_ffrecord.c:28
+    - if (i > e) { rd->nres = 0; return; }
+    + if (i < e) { rd->nres = 0; return; }
+
+    lj_ffrecord.c:28
+    - if (i > e) { rd->nres = 0; return; }
+    + if (i <= e) { rd->nres = 0; return; }
+
+    lj_ffrecord.c:28
+    - if (i > e) { rd->nres = 0; return; }
+    + if (i >= e) { rd->nres = 0; return; }
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn == 0) || (span >= ((uint32_t) maxn)))
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn != 0) || (span >= ((uint32_t) maxn)))
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn < 0) || (span >= ((uint32_t) maxn)))
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn > 0) || (span >= ((uint32_t) maxn)))
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn >= 0) || (span >= ((uint32_t) maxn)))
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn <= 0) || (span == ((uint32_t) maxn)))
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn <= 0) || (span != ((uint32_t) maxn)))
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn <= 0) || (span < ((uint32_t) maxn)))
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn <= 0) || (span <= ((uint32_t) maxn)))
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn <= 0) || (span > ((uint32_t) maxn)))
+
+    lj_ffrecord.c:37
+    - for (k = 0; k < n; k++) {
+    + for (k = 0; k == n; k++) {
+
+    lj_ffrecord.c:37
+    - for (k = 0; k < n; k++) {
+    + for (k = 0; k != n; k++) {
+
+    lj_ffrecord.c:37
+    - for (k = 0; k < n; k++) {
+    + for (k = 0; k <= n; k++) {
+
+    lj_ffrecord.c:37
+    - for (k = 0; k < n; k++) {
+    + for (k = 0; k > n; k++) {
+
+    lj_ffrecord.c:37
+    - for (k = 0; k < n; k++) {
+    + for (k = 0; k >= n; k++) {
+
+    Survived: 64/64
     """
 )
 
@@ -308,7 +408,7 @@ class TestRecffUnpackMutantList(unittest.TestCase):
             self.fail(f"mutant report for recff_unpack differs:\n{diff}")
 
         # --run true never fails, so nothing gets killed: every one of
-        # the 44 mutants "survives", which is also why the exit code is
+        # the 64 mutants "survives", which is also why the exit code is
         # 1 here (unimut's CLI convention: nonzero iff something
         # survived) rather than a sign anything is actually wrong.
         self.assertEqual(self.exit_code, 1)
