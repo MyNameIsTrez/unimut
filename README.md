@@ -16,7 +16,7 @@ src/lj_ffrecord.c:13
 src/lj_ffrecord.c:27
 - if (i > e) { rd->nres = 0; return; }
 
-Survived: 2/42
+Survived: 2/44
 ```
 
 `- ` lines (removed code) print red; `+ ` lines (replacement code, for mutation kinds that have one) print green. `unimut` exits `0` if nothing survived, `1` otherwise (or on error) -- usable as a CI gate.

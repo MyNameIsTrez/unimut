@@ -13,9 +13,9 @@ unimut generates for this function, not just survivors. ``--run true``
 is a trivial always-succeeding command; it doesn't try to validate any
 real LuaJIT semantics, it exists purely so every generated mutant
 "survives" and therefore is guaranteed to show up in the report. That
-turns the report into a plain enumeration of the 42 statement-removal
+turns the report into a plain enumeration of the 44 statement-removal
 candidates unimut finds in this function -- the exact reference count
-from the README's own ``recff_unpack`` example (``Survived: 2/42``,
+from the README's own ``recff_unpack`` example (``Survived: 2/44``,
 there run against a real test suite) -- which is what gets diffed
 against ``EXPECTED_REPORT`` below.
 
@@ -104,7 +104,10 @@ RECFF_UNPACK_SRC = textwrap.dedent(
 # if/else-clause" one: removing just the bare body (replacing it with `;`)
 # or removing the else clause outright. That's what accounts for entries
 # like line 11's second variant (`+ if (!tref_istab(trtab)) ;`) and line
-# 14's standalone `- else {` below.
+# 14's standalone `- else {` below. Both of those `if`/`else` pairs (lines
+# 13 and 19) also get a third variant each: collapsing the whole `if`
+# statement down to just its `else` content, executed unconditionally
+# (`+ { i = argv2int(...); ... }` at line 13, and similarly at line 19).
 EXPECTED_REPORT = textwrap.dedent(
     """\
     lj_ffrecord.c:5
@@ -149,6 +152,10 @@ EXPECTED_REPORT = textwrap.dedent(
 
     lj_ffrecord.c:13
     - if (tref_isnil(tri)) i = 1;
+    + { i = argv2int(J, &rd->argv[1]); if (tref_isk(tri)) emitir(IRTGI(IR_EQ), tri, lj_ir_kint(J, i)); }
+
+    lj_ffrecord.c:13
+    - if (tref_isnil(tri)) i = 1;
     + if (tref_isnil(tri)) ;
 
     lj_ffrecord.c:14
@@ -166,6 +173,10 @@ EXPECTED_REPORT = textwrap.dedent(
 
     lj_ffrecord.c:19
     - if (!tref_isnil(trj)) {  /* trj set guarantees tri was too. */
+
+    lj_ffrecord.c:19
+    - if (!tref_isnil(trj)) {  /* trj set guarantees tri was too. */
+    + { TRef trlen = emitir(IRTI(IR_ALEN), trtab, TREF_NIL); e = (int32_t) lj_tab_len(t); emitir(IRTGI(IR_EQ), trlen, lj_ir_kint(J, e)); }
 
     lj_ffrecord.c:20
     - e = argv2int(J, &rd->argv[2]);
@@ -246,7 +257,7 @@ EXPECTED_REPORT = textwrap.dedent(
     lj_ffrecord.c:40
     - J->base[k] = lj_record_idx(J, &ix);
 
-    Survived: 42/42
+    Survived: 44/44
     """
 )
 
@@ -297,7 +308,7 @@ class TestRecffUnpackMutantList(unittest.TestCase):
             self.fail(f"mutant report for recff_unpack differs:\n{diff}")
 
         # --run true never fails, so nothing gets killed: every one of
-        # the 42 mutants "survives", which is also why the exit code is
+        # the 44 mutants "survives", which is also why the exit code is
         # 1 here (unimut's CLI convention: nonzero iff something
         # survived) rather than a sign anything is actually wrong.
         self.assertEqual(self.exit_code, 1)

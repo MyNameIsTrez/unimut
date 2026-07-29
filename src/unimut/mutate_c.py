@@ -408,12 +408,26 @@ _MANDATORY_BODY_ATTRS = {"iftrue", "stmt"}
 # needs the same explicit treatment.
 _OPTIONAL_BODY_ATTRS = {"iffalse"}
 
+# A synthetic path component (never a real pycparser attribute name) marking
+# a third kind of ``if``/``else`` mutant: replace the *entire* ``if``
+# statement -- condition, ``iftrue`` branch and all -- with just its
+# ``else`` clause's content, executed unconditionally. This is different
+# from both removing the whole ``if`` (which drops the else branch too) and
+# removing just the else clause (which keeps the ``if`` guarding the then
+# branch): here the then branch and the condition both disappear, and
+# whatever the else clause held becomes the new, unconditional code. It's
+# appended as an extra path alongside wherever the ``If`` node itself was
+# found, so it's always paired with a plain deletion candidate for the same
+# node.
+_UNWRAP_ELSE_MARKER = "__unwrap_else__"
+
 
 def _find_block_item_paths(node, path: Tuple[str, ...] = ()) -> List[Tuple[str, ...]]:
     """Return the path of every statement-removal candidate reachable from
     ``node``: every entry of every ``{ ... }`` block's ``block_items``, plus
-    every bare (unbraced) ``if``/loop body and every ``else`` clause (see
-    ``_MANDATORY_BODY_ATTRS``/``_OPTIONAL_BODY_ATTRS`` above)."""
+    every bare (unbraced) ``if``/loop body, every ``else`` clause, and every
+    "collapse to the else branch" candidate (see ``_MANDATORY_BODY_ATTRS``/
+    ``_OPTIONAL_BODY_ATTRS``/``_UNWRAP_ELSE_MARKER`` above)."""
     results: List[Tuple[str, ...]] = []
     for name, child in node.children():
         child_path = path + (name,)
@@ -423,6 +437,8 @@ def _find_block_item_paths(node, path: Tuple[str, ...] = ()) -> List[Tuple[str, 
             results.append(child_path)
         elif name in _MANDATORY_BODY_ATTRS and not isinstance(child, c_ast.Compound):
             results.append(child_path)
+        if isinstance(child, c_ast.If) and child.iffalse is not None:
+            results.append(child_path + (_UNWRAP_ELSE_MARKER,))
         results.extend(_find_block_item_paths(child, child_path))
     return results
 
@@ -430,7 +446,12 @@ def _find_block_item_paths(node, path: Tuple[str, ...] = ()) -> List[Tuple[str, 
 def _get_by_path(root: c_ast.Node, path: Tuple[str, ...]) -> c_ast.Node:
     node: c_ast.Node = root
     for component in path:
-        if "[" in component:
+        if component == _UNWRAP_ELSE_MARKER:
+            # Purely a marker for "this If, but the unwrap-else mutation" --
+            # it doesn't navigate anywhere, the node of interest is the If
+            # itself, already reached by the preceding path components.
+            continue
+        elif "[" in component:
             attr, idx = component[:-1].split("[")
             node = getattr(node, attr)[int(idx)]
         else:
@@ -444,7 +465,31 @@ def _node_line(node: c_ast.Node) -> Optional[int]:
     return coord.line if coord else None
 
 
+def _unwrap_else(root: c_ast.Node, if_path: Tuple[str, ...]) -> None:
+    """Replace the ``If`` node at ``if_path`` with its own ``iffalse``
+    clause, wherever that ``If`` itself lives -- a ``block_items`` list
+    slot, or a bare ``iftrue``/``stmt`` attribute of some further-out
+    construct. Either way, this is a plain substitution: the condition and
+    the ``iftrue`` branch vanish, and the else clause's content takes the
+    ``If``'s place verbatim, now unconditional.
+    """
+    if_node = _get_by_path(root, if_path)
+    assert isinstance(if_node, c_ast.If), f"unwrap-else path {if_path!r} is not an If"
+    iffalse = if_node.iffalse
+    assert iffalse is not None
+    container = _get_by_path(root, if_path[:-1])
+    last = if_path[-1]
+    if "[" in last:
+        attr, idx = last[:-1].split("[")
+        getattr(container, attr)[int(idx)] = iffalse
+    else:
+        setattr(container, last, iffalse)
+
+
 def _remove_by_path(root, path: Tuple[str, ...]) -> None:
+    if path[-1] == _UNWRAP_ELSE_MARKER:
+        _unwrap_else(root, path[:-1])
+        return
     parent = _get_by_path(root, path[:-1])
     last = path[-1]
     if "[" in last:
@@ -688,6 +733,18 @@ def _mandatory_body_replacement(
     return "do ;"
 
 
+def _unwrap_else_preview(
+    gen: c_generator.CGenerator, ast: c_ast.FileAST, if_path: Tuple[str, ...]
+) -> str:
+    """Build the ``+`` preview for collapsing an ``If`` down to just its
+    ``else`` clause -- literally that clause's own text, unindented onto
+    one line, since that's exactly what ends up where the ``if`` used to
+    be (see :func:`_unwrap_else`)."""
+    if_node = _get_by_path(ast, if_path)
+    assert isinstance(if_node, c_ast.If), f"unwrap-else path {if_path!r} is not an If"
+    return _collapse_to_one_line(gen._generate_stmt(if_node.iffalse))
+
+
 def _compute_mutated_text(
     gen: c_generator.CGenerator,
     ast: c_ast.FileAST,
@@ -711,6 +768,9 @@ def _compute_mutated_text(
         }``) -- the enclosing statement is regenerated with just that
         nested statement removed, then collapsed back onto one line.
     """
+    if target_path[-1] == _UNWRAP_ELSE_MARKER:
+        return _unwrap_else_preview(gen, ast, target_path[:-1])
+
     if target_path[-1] in _MANDATORY_BODY_ATTRS:
         return _mandatory_body_replacement(gen, ast, target_path, line_of)
 
@@ -1130,6 +1190,24 @@ class TestElseClauseRemoval(unittest.TestCase):
         if _CC:
             self.assertTrue(_compiles(mutated_source))
 
+    def test_removing_whole_if_drops_both_branches_not_just_condition(self):
+        # This is the *other* candidate on the same line as the "else"
+        # tests above: not "remove just the else clause" (tested above),
+        # but "remove the whole if" -- i.e. the entire `If` node,
+        # `iftrue` and `iffalse` together, deleted from its enclosing
+        # block. It must NOT turn into "the else branch runs
+        # unconditionally" -- both branches disappear along with the
+        # condition, leaving neither assignment behind.
+        mutants = generate_mutants("classify.c", self.BRACED_SRC)
+        mutant = next(m for m in mutants if m.original == "if (n > 0) {")
+        self.assertIsNone(mutant.mutated)
+        mutated_source = mutant.apply(self.BRACED_SRC)
+        self.assertNotIn("result = 1;", mutated_source)
+        self.assertNotIn("result = -1;", mutated_source)
+        self.assertNotIn("else", mutated_source)
+        if _CC:
+            self.assertTrue(_compiles(mutated_source))
+
     def test_bare_else_is_a_candidate_and_removable(self):
         mutants = generate_mutants("classify.c", self.BARE_SRC)
         mutant = next(m for m in mutants if m.original == "else result = -1;")
@@ -1174,6 +1252,62 @@ class TestBareLoopBody(unittest.TestCase):
         self.assertNotIn("total += k++", mutated_source)
         if _CC:
             self.assertTrue(_compiles(mutated_source))
+
+
+class TestUnwrapElse(unittest.TestCase):
+    """Collapsing an ``if``/``else`` down to just the ``else`` branch,
+    executed unconditionally, dropping the condition and the ``iftrue``
+    branch entirely. Distinct from removing the whole ``if`` (which drops
+    the else branch too) and from removing just the else clause (which
+    keeps the ``if`` guarding an empty-ish then branch)."""
+
+    COMPOUND_ELSE_SRC = textwrap.dedent(
+        """\
+        void demo(void) {
+          // unimut on
+          if (true) {} else { foo(); bar(); }
+          // unimut off
+        }
+        """
+    )
+
+    ELSE_IF_SRC = textwrap.dedent(
+        """\
+        void demo(void) {
+          // unimut on
+          if (true) {} else if (true) { foo(); bar(); }
+          // unimut off
+        }
+        """
+    )
+
+    _COMPILE_PREAMBLE = (
+        "typedef int bool_;\n#define true 1\nvoid foo(void);\nvoid bar(void);\n"
+    )
+
+    def test_compound_else_unwraps_to_a_bare_block(self):
+        mutants = generate_mutants("demo.c", self.COMPOUND_ELSE_SRC)
+        mutant = next(m for m in mutants if m.mutated == "{ foo(); bar(); }")
+        mutated_source = mutant.apply(self.COMPOUND_ELSE_SRC)
+        self.assertNotIn("if (true)", mutated_source)
+        self.assertNotIn("else", mutated_source)
+        self.assertIn("foo();", mutated_source)
+        self.assertIn("bar();", mutated_source)
+        if _CC:
+            self.assertTrue(_compiles(self._COMPILE_PREAMBLE + mutated_source))
+
+    def test_else_if_unwraps_to_the_inner_if(self):
+        mutants = generate_mutants("demo.c", self.ELSE_IF_SRC)
+        mutant = next(m for m in mutants if m.mutated == "if (true) { foo(); bar(); }")
+        mutated_source = mutant.apply(self.ELSE_IF_SRC)
+        self.assertNotIn("else", mutated_source)
+        self.assertIn("foo();", mutated_source)
+        self.assertIn("bar();", mutated_source)
+        # Only one "if" should remain -- the outer one (with the always-{}
+        # then-branch) is gone, collapsed into what used to be its else.
+        self.assertEqual(mutated_source.count("if ("), 1)
+        if _CC:
+            self.assertTrue(_compiles(self._COMPILE_PREAMBLE + mutated_source))
 
 
 class TestRealWorldStyleSnippet(unittest.TestCase):
