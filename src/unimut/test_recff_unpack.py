@@ -13,9 +13,9 @@ unimut generates for this function, not just survivors. ``--run true``
 is a trivial always-succeeding command; it doesn't try to validate any
 real LuaJIT semantics, it exists purely so every generated mutant
 "survives" and therefore is guaranteed to show up in the report. That
-turns the report into a plain enumeration of the 35 statement-removal
+turns the report into a plain enumeration of the 42 statement-removal
 candidates unimut finds in this function -- the exact reference count
-from the README's own ``recff_unpack`` example (``Survived: 2/35``,
+from the README's own ``recff_unpack`` example (``Survived: 2/42``,
 there run against a real test suite) -- which is what gets diffed
 against ``EXPECTED_REPORT`` below.
 
@@ -97,6 +97,14 @@ RECFF_UNPACK_SRC = textwrap.dedent(
 # for TRef/jit_State/RecordFFData/RecordIndex/GCtab (all unknown to
 # pycparser) and strips the LJ_FASTCALL macro on its own -- no manual
 # preamble was needed to get this function to parse.
+#
+# This function's several unbraced `if (cond) stmt;` bodies (e.g. line 11's
+# `return;`, line 13's `i = 1;`) and its two `else` clauses (lines 14 and 23)
+# each contribute an extra candidate beyond the "remove the whole
+# if/else-clause" one: removing just the bare body (replacing it with `;`)
+# or removing the else clause outright. That's what accounts for entries
+# like line 11's second variant (`+ if (!tref_istab(trtab)) ;`) and line
+# 14's standalone `- else {` below.
 EXPECTED_REPORT = textwrap.dedent(
     """\
     lj_ffrecord.c:5
@@ -129,17 +137,32 @@ EXPECTED_REPORT = textwrap.dedent(
     lj_ffrecord.c:11
     - if (!tref_istab(trtab)) return;  /* Interpreter will throw. */
 
+    lj_ffrecord.c:11
+    - if (!tref_istab(trtab)) return;  /* Interpreter will throw. */
+    + if (!tref_istab(trtab)) ;
+
     lj_ffrecord.c:12
     - t = tabV(&rd->argv[0]);
 
     lj_ffrecord.c:13
     - if (tref_isnil(tri)) i = 1;
 
+    lj_ffrecord.c:13
+    - if (tref_isnil(tri)) i = 1;
+    + if (tref_isnil(tri)) ;
+
+    lj_ffrecord.c:14
+    - else {
+
     lj_ffrecord.c:15
     - i = argv2int(J, &rd->argv[1]);
 
     lj_ffrecord.c:16
     - if (tref_isk(tri))
+
+    lj_ffrecord.c:17
+    - emitir(IRTGI(IR_EQ), tri, lj_ir_kint(J, i));
+    + ;
 
     lj_ffrecord.c:19
     - if (!tref_isnil(trj)) {  /* trj set guarantees tri was too. */
@@ -149,6 +172,13 @@ EXPECTED_REPORT = textwrap.dedent(
 
     lj_ffrecord.c:21
     - if (!tref_isk(trj))
+
+    lj_ffrecord.c:22
+    - emitir(IRTGI(IR_EQ), trj, lj_ir_kint(J, e));
+    + ;
+
+    lj_ffrecord.c:23
+    - } else {  /* Guard the length, since it wasn't given as a constant. */
 
     lj_ffrecord.c:24
     - TRef trlen = emitir(IRTI(IR_ALEN), trtab, TREF_NIL);
@@ -178,6 +208,10 @@ EXPECTED_REPORT = textwrap.dedent(
 
     lj_ffrecord.c:31
     - if (maxn <= 0 || span >= (uint32_t)maxn)
+
+    lj_ffrecord.c:32
+    - lj_trace_err_info(J, LJ_TRERR_STACKOV);
+    + ;
 
     lj_ffrecord.c:33
     - int32_t n = (int32_t)span + 1;  /* safe: span < maxn <= LJ_MAX_JSLOTS here. */
@@ -212,7 +246,7 @@ EXPECTED_REPORT = textwrap.dedent(
     lj_ffrecord.c:40
     - J->base[k] = lj_record_idx(J, &ix);
 
-    Survived: 35/35
+    Survived: 42/42
     """
 )
 
@@ -263,7 +297,7 @@ class TestRecffUnpackMutantList(unittest.TestCase):
             self.fail(f"mutant report for recff_unpack differs:\n{diff}")
 
         # --run true never fails, so nothing gets killed: every one of
-        # the 35 mutants "survives", which is also why the exit code is
+        # the 42 mutants "survives", which is also why the exit code is
         # 1 here (unimut's CLI convention: nonzero iff something
         # survived) rather than a sign anything is actually wrong.
         self.assertEqual(self.exit_code, 1)

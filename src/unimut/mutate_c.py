@@ -389,12 +389,39 @@ def _children_by_path(node, path):
         yield name
 
 
+# Attribute names (as returned by pycparser's ``Node.children()``) that hold
+# a *mandatory* single child statement -- the "then" branch of an ``if`` and
+# the body of a ``while``/``do``/``for`` loop. C requires *some* statement
+# there, so when one of these isn't a ``{ ... }`` block it's just a bare
+# statement hanging directly off the ``If``/``While``/``DoWhile``/``For``
+# node -- never an entry in anyone's ``block_items`` list. Without treating
+# the attribute itself as a candidate, a one-liner like ``if (cond) return;``
+# would only ever offer "remove the whole if" as a mutant, never "remove
+# just the return and leave the condition being evaluated for nothing" --
+# a meaningfully different (and often uncaught) mutant.
+_MANDATORY_BODY_ATTRS = {"iftrue", "stmt"}
+
+# Attribute names that hold an *optional* single child: only ``If.iffalse``
+# (the ``else`` clause) today. Whether or not it's braced, "delete the whole
+# else branch" is a distinct, worthwhile mutant that -- like the mandatory
+# bodies above -- never shows up as a ``block_items`` entry anywhere, so it
+# needs the same explicit treatment.
+_OPTIONAL_BODY_ATTRS = {"iffalse"}
+
+
 def _find_block_item_paths(node, path: Tuple[str, ...] = ()) -> List[Tuple[str, ...]]:
-    """Return the path of every statement inside a ``{ ... }`` block."""
+    """Return the path of every statement-removal candidate reachable from
+    ``node``: every entry of every ``{ ... }`` block's ``block_items``, plus
+    every bare (unbraced) ``if``/loop body and every ``else`` clause (see
+    ``_MANDATORY_BODY_ATTRS``/``_OPTIONAL_BODY_ATTRS`` above)."""
     results: List[Tuple[str, ...]] = []
     for name, child in node.children():
         child_path = path + (name,)
         if "[" in name and name.split("[", 1)[0] == "block_items":
+            results.append(child_path)
+        elif name in _OPTIONAL_BODY_ATTRS:
+            results.append(child_path)
+        elif name in _MANDATORY_BODY_ATTRS and not isinstance(child, c_ast.Compound):
             results.append(child_path)
         results.extend(_find_block_item_paths(child, child_path))
     return results
@@ -419,8 +446,19 @@ def _node_line(node: c_ast.Node) -> Optional[int]:
 
 def _remove_by_path(root, path: Tuple[str, ...]) -> None:
     parent = _get_by_path(root, path[:-1])
-    attr, idx = path[-1][:-1].split("[")
-    del getattr(parent, attr)[int(idx)]
+    last = path[-1]
+    if "[" in last:
+        attr, idx = last[:-1].split("[")
+        del getattr(parent, attr)[int(idx)]
+    elif last in _OPTIONAL_BODY_ATTRS:
+        # else clause: simply absent, same as if it was never written.
+        setattr(parent, last, None)
+    else:
+        assert last in _MANDATORY_BODY_ATTRS, f"unrecognized removal path {last!r}"
+        # if/loop body: C has no "no statement here" for these positions,
+        # so the closest thing to "removed" is the empty statement -- the
+        # condition (still) gets evaluated, but nothing happens as a result.
+        setattr(parent, last, c_ast.EmptyStatement(coord=getattr(parent, last).coord))
 
 
 def _region_source(ast: c_ast.FileAST, n_fake_decls: int, wrapped: bool) -> str:
@@ -589,6 +627,67 @@ def _collapse_to_one_line(text: str) -> str:
     return " ".join(line.strip() for line in text.splitlines() if line.strip())
 
 
+def _mandatory_body_replacement(
+    gen: c_generator.CGenerator,
+    ast: c_ast.FileAST,
+    target_path: Tuple[str, ...],
+    line_of: Dict[Tuple[str, ...], Optional[int]],
+) -> str:
+    """Build the ``+`` preview text for removing an ``if``/loop body
+    (an ``iftrue``/``stmt`` candidate from ``_MANDATORY_BODY_ATTRS``).
+
+    This is deliberately its own thing rather than a call into
+    :func:`_compute_mutated_text`'s general ancestor-collapse logic below,
+    which assumes the "unit" it regenerates corresponds to exactly one
+    physical source line. That assumption holds for the nested-statement
+    case it was built for (a statement inside a single-line ``{ ... }``
+    compound), but not here: an ``If`` node's own coordinate can share the
+    removed body's line while its ``else`` clause lives several lines
+    later, and naively regenerating the whole ``If`` (as the general path
+    would) drags that unrelated, unmutated ``else`` block into the ``+``
+    line. The replacement here is always scoped to exactly the physical
+    line the removed body itself occupied.
+    """
+    parent = _get_by_path(ast, target_path[:-1])
+    body_line = line_of[target_path]
+    header_line = _node_line(parent)
+
+    if header_line != body_line:
+        # The body lives on its own line, separate from the
+        # if/while/for/do header (e.g. ``if (cond)\n  stmt;``) -- removing
+        # it just turns that one line into an empty statement; the header
+        # is on a different, unaffected line (and reported separately, if
+        # it's itself a candidate).
+        return ";"
+
+    if isinstance(parent, c_ast.If):
+        cond = gen.visit(parent.cond) if parent.cond is not None else ""
+        text = f"if ({cond}) ;"
+        if parent.iffalse is not None and _node_line(parent.iffalse) == body_line:
+            # The else clause is crammed onto this very same physical
+            # line -- keep it, unchanged, in the reconstructed line.
+            else_text = _collapse_to_one_line(gen._generate_stmt(parent.iffalse))
+            text += f" else {else_text}"
+        return text
+
+    if isinstance(parent, c_ast.While):
+        cond = gen.visit(parent.cond) if parent.cond is not None else ""
+        return f"while ({cond}) ;"
+
+    if isinstance(parent, c_ast.For):
+        init = gen.visit(parent.init) if parent.init is not None else ""
+        cond = gen.visit(parent.cond) if parent.cond is not None else ""
+        nxt = gen.visit(parent.next) if parent.next is not None else ""
+        return f"for ({init}; {cond}; {nxt}) ;"
+
+    assert isinstance(parent, c_ast.DoWhile)
+    cond = gen.visit(parent.cond) if parent.cond is not None else ""
+    if parent.cond is not None and _node_line(parent.cond) == body_line:
+        # The whole "do ... while (...);" is crammed onto one line.
+        return f"do ; while ({cond});"
+    return "do ;"
+
+
 def _compute_mutated_text(
     gen: c_generator.CGenerator,
     ast: c_ast.FileAST,
@@ -612,6 +711,9 @@ def _compute_mutated_text(
         }``) -- the enclosing statement is regenerated with just that
         nested statement removed, then collapsed back onto one line.
     """
+    if target_path[-1] in _MANDATORY_BODY_ATTRS:
+        return _mandatory_body_replacement(gen, ast, target_path, line_of)
+
     unit_path = _find_line_unit_path(all_paths, line_of, target_path)
 
     if unit_path == target_path:
@@ -913,6 +1015,163 @@ class TestNestedBlocks(unittest.TestCase):
         mutant = next(m for m in mutants if m.original == "if (n > 0) {")
         mutated_source = mutant.apply(self.SRC)
         self.assertNotIn("result = 1;", mutated_source)
+        if _CC:
+            self.assertTrue(_compiles(mutated_source))
+
+
+class TestBareIfBody(unittest.TestCase):
+    """An unbraced ``if (cond) stmt;`` body is never a ``block_items``
+    entry anywhere, so without explicit handling it would never be
+    offered as its own removal candidate -- only "remove the whole if"
+    would show up. See ``_MANDATORY_BODY_ATTRS``."""
+
+    SRC = textwrap.dedent(
+        """\
+        int classify(int n) {
+          // unimut on
+          int result = 0;
+          if (n > 0) result = 1;
+          // unimut off
+          return result;
+        }
+        """
+    )
+
+    def test_bare_body_is_its_own_candidate(self):
+        mutants = generate_mutants("classify.c", self.SRC)
+        originals_and_mutated = [(m.original, m.mutated) for m in mutants]
+        # "remove the whole if" (existing behavior) ...
+        self.assertIn(("if (n > 0) result = 1;", None), originals_and_mutated)
+        # ... and "remove just the body, still evaluate the condition"
+        # (this is the fix): same source line, different mutant.
+        self.assertIn(("if (n > 0) result = 1;", "if (n > 0) ;"), originals_and_mutated)
+
+    def test_removing_bare_body_only_compiles_and_keeps_condition(self):
+        mutants = generate_mutants("classify.c", self.SRC)
+        mutant = next(m for m in mutants if m.mutated == "if (n > 0) ;")
+        mutated_source = mutant.apply(self.SRC)
+        self.assertIn("if (n > 0)", mutated_source)
+        self.assertNotIn("result = 1;", mutated_source)
+        if _CC:
+            self.assertTrue(_compiles(mutated_source))
+
+    def test_bare_body_on_its_own_line_shows_plain_empty_statement(self):
+        # When the body is on a *different* physical line than the "if"
+        # itself, the "+" preview must be scoped to just that line -- not
+        # the whole (possibly multi-line) if/else reconstructed.
+        src = textwrap.dedent(
+            """\
+            int classify(int n) {
+              // unimut on
+              int result = 0;
+              if (n > 0)
+                result = 1;
+              // unimut off
+              return result;
+            }
+            """
+        )
+        mutants = generate_mutants("classify.c", src)
+        mutant = next(m for m in mutants if m.original == "result = 1;")
+        self.assertEqual(mutant.mutated, ";")
+        mutated_source = mutant.apply(src)
+        self.assertIn("if (n > 0)", mutated_source)
+        self.assertNotIn("result = 1;", mutated_source)
+        if _CC:
+            self.assertTrue(_compiles(mutated_source))
+
+
+class TestElseClauseRemoval(unittest.TestCase):
+    """Removing an entire ``else`` clause -- braced or not -- is a
+    distinct, worthwhile mutant that (like a bare if body) never shows up
+    as a ``block_items`` entry anywhere. See ``_OPTIONAL_BODY_ATTRS``."""
+
+    BRACED_SRC = textwrap.dedent(
+        """\
+        int classify(int n) {
+          // unimut on
+          int result;
+          if (n > 0) {
+            result = 1;
+          } else {
+            result = -1;
+          }
+          // unimut off
+          return result;
+        }
+        """
+    )
+
+    BARE_SRC = textwrap.dedent(
+        """\
+        int classify(int n) {
+          // unimut on
+          int result;
+          if (n > 0) result = 1;
+          else result = -1;
+          // unimut off
+          return result;
+        }
+        """
+    )
+
+    def test_braced_else_is_a_candidate(self):
+        mutants = generate_mutants("classify.c", self.BRACED_SRC)
+        originals = [m.original for m in mutants]
+        self.assertIn("} else {", originals)
+
+    def test_removing_braced_else_drops_only_the_else_branch(self):
+        mutants = generate_mutants("classify.c", self.BRACED_SRC)
+        mutant = next(m for m in mutants if m.original == "} else {")
+        mutated_source = mutant.apply(self.BRACED_SRC)
+        self.assertIn("result = 1;", mutated_source)
+        self.assertNotIn("result = -1;", mutated_source)
+        self.assertNotIn("else", mutated_source)
+        if _CC:
+            self.assertTrue(_compiles(mutated_source))
+
+    def test_bare_else_is_a_candidate_and_removable(self):
+        mutants = generate_mutants("classify.c", self.BARE_SRC)
+        mutant = next(m for m in mutants if m.original == "else result = -1;")
+        mutated_source = mutant.apply(self.BARE_SRC)
+        self.assertIn("result = 1;", mutated_source)
+        self.assertNotIn("result = -1;", mutated_source)
+        if _CC:
+            self.assertTrue(_compiles(mutated_source))
+
+
+class TestBareLoopBody(unittest.TestCase):
+    """The unbraced body of a ``while``/``for`` loop gets the same
+    treatment as an unbraced ``if`` body."""
+
+    SRC = textwrap.dedent(
+        """\
+        int sum_to(int n) {
+          // unimut on
+          int total = 0;
+          int k = 0;
+          while (k < n) total += k++;
+          // unimut off
+          return total;
+        }
+        """
+    )
+
+    def test_bare_while_body_is_its_own_candidate(self):
+        mutants = generate_mutants("sum_to.c", self.SRC)
+        originals_and_mutated = [(m.original, m.mutated) for m in mutants]
+        self.assertIn(("while (k < n) total += k++;", None), originals_and_mutated)
+        self.assertIn(
+            ("while (k < n) total += k++;", "while (k < n) ;"),
+            originals_and_mutated,
+        )
+
+    def test_removing_bare_while_body_compiles(self):
+        mutants = generate_mutants("sum_to.c", self.SRC)
+        mutant = next(m for m in mutants if m.mutated == "while (k < n) ;")
+        mutated_source = mutant.apply(self.SRC)
+        self.assertIn("while (k < n)", mutated_source)
+        self.assertNotIn("total += k++", mutated_source)
         if _CC:
             self.assertTrue(_compiles(mutated_source))
 
