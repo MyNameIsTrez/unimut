@@ -461,7 +461,7 @@ def _get_by_path(root: c_ast.Node, path: Tuple[str, ...]) -> c_ast.Node:
 
 def _node_line(node: c_ast.Node) -> Optional[int]:
     """``node.coord.line``, or None if ``node`` has no coordinate info."""
-    coord = node.coord
+    coord = getattr(node, "coord", None)
     return coord.line if coord else None
 
 
