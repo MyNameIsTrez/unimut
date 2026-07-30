@@ -434,27 +434,27 @@ EXPECTED_REPORT = textwrap.dedent(
 
     lj_ffrecord.c:34
     - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
-    + ix.tab = trtab + 1;
+    + ix.tab = trtab + 1; ix.idxchain = 0; ix.val = 0;
 
     lj_ffrecord.c:34
     - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
-    + ix.tab = trtab - 1;
+    + ix.tab = trtab - 1; ix.idxchain = 0; ix.val = 0;
 
     lj_ffrecord.c:34
     - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
-    + ix.idxchain = 0 + 1;
+    + ix.tab = trtab; ix.idxchain = 0 + 1; ix.val = 0;
 
     lj_ffrecord.c:34
     - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
-    + ix.idxchain = 0 - 1;
+    + ix.tab = trtab; ix.idxchain = 0 - 1; ix.val = 0;
 
     lj_ffrecord.c:34
     - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
-    + ix.val = 0 + 1;
+    + ix.tab = trtab; ix.idxchain = 0; ix.val = 0 + 1;
 
     lj_ffrecord.c:34
     - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
-    + ix.val = 0 - 1;
+    + ix.tab = trtab; ix.idxchain = 0; ix.val = 0 - 1;
 
     lj_ffrecord.c:36
     - rd->nres = n;

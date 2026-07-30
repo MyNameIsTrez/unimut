@@ -750,6 +750,10 @@ def _find_enclosing_statement_path(
 
 def _render_mutated_statement_text(
     gen: c_generator.CGenerator,
+    ast: c_ast.FileAST,
+    all_paths: List[Tuple[str, ...]],
+    line_of: Dict[Tuple[str, ...], Optional[int]],
+    unit_path: Tuple[str, ...],
     unit_node: c_ast.Node,
     unit_copy: c_ast.Node,
     target_line: int,
@@ -764,11 +768,41 @@ def _render_mutated_statement_text(
     :func:`_compute_mutated_text`). Shared by both comparison-operator
     swapping and RHS +1/-1 mutation -- neither cares what kind of
     mutation produced ``unit_copy``, only where it lives.
+
+    ``unit_node`` may itself be one of several sibling statements packed
+    onto ``target_line`` (e.g. ``ix.tab = trtab; ix.idxchain = 0; ix.val
+    = 0;``) rather than something that structurally contains them --
+    unlike the nested-inside-a-single-line-compound case, these siblings
+    aren't part of ``unit_node``'s own subtree, so regenerating just
+    ``unit_copy`` would silently drop them from the ``+`` line. Mirroring
+    :func:`_compute_mutated_text`'s handling of the same situation for
+    statement removal, every sibling that shares ``unit_path``'s parent
+    and ``target_line`` is re-joined onto the line, substituting
+    ``unit_copy`` in for the one that was actually mutated.
     """
     if isinstance(
         unit_node, (c_ast.If, c_ast.While, c_ast.For, c_ast.DoWhile)
     ) and not _header_spans_whole_statement(unit_node, target_line):
         return _operator_header_text(gen, unit_copy, target_line)
+
+    if unit_path:
+        parent_prefix = unit_path[:-1]
+        siblings = [
+            p
+            for p in all_paths
+            if p[:-1] == parent_prefix and line_of.get(p) == target_line
+        ]
+        if len(siblings) > 1:
+            parts = [
+                _collapse_to_one_line(
+                    gen._generate_stmt(
+                        unit_copy if p == unit_path else _get_by_path(ast, p)
+                    )
+                )
+                for p in siblings
+            ]
+            return " ".join(parts)
+
     return _collapse_to_one_line(gen._generate_stmt(unit_copy))
 
 
@@ -799,7 +833,9 @@ def _compute_operator_mutated_text(
     target_in_copy = cast(c_ast.BinaryOp, _get_by_path(unit_copy, relative_path))
     target_in_copy.op = new_op
 
-    return _render_mutated_statement_text(gen, unit_node, unit_copy, target_line)
+    return _render_mutated_statement_text(
+        gen, ast, all_paths, line_of, unit_path, unit_node, unit_copy, target_line
+    )
 
 
 @dataclasses.dataclass
@@ -911,7 +947,9 @@ def _compute_rhs_offset_mutated_text(
     wrapped = c_ast.BinaryOp(op, original_in_copy, c_ast.Constant("int", "1"))
     _set_by_path(unit_copy, relative_path, wrapped)
 
-    return _render_mutated_statement_text(gen, unit_node, unit_copy, target_line)
+    return _render_mutated_statement_text(
+        gen, ast, all_paths, line_of, unit_path, unit_node, unit_copy, target_line
+    )
 
 
 @dataclasses.dataclass
