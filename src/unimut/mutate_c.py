@@ -611,32 +611,77 @@ def _control_body(node: c_ast.Node):
     return None
 
 
+def _statement_fits_on_line(stmt: c_ast.Node, target_line: int) -> bool:
+    """True if regenerating ``stmt`` in full and collapsing it to one
+    line would faithfully reproduce ``target_line`` -- i.e. ``stmt``
+    itself (a compound's contents included, not just its opening brace)
+    lives entirely on that one physical source line.
+    """
+    if isinstance(stmt, c_ast.Compound):
+        items = stmt.block_items or []
+        if not items:
+            return _node_line(stmt) == target_line
+        return _node_line(stmt) == target_line and all(
+            _node_line(item) == target_line for item in items
+        )
+    return _node_line(stmt) == target_line
+
+
 def _header_spans_whole_statement(node: c_ast.Node, target_line: int) -> bool:
     """True if regenerating the *entire* control statement ``node`` (header
-    and body alike), then collapsing it to one line, faithfully reproduces
+    and body alike -- and, for an ``if``, its ``else`` clause too, if it
+    has one), then collapsing it to one line, faithfully reproduces
     ``target_line`` -- i.e. the whole thing (not just the header) already
     lives on that one physical source line, the way ``if (i > e) { rd->nres
     = 0; return; }`` does.
 
-    False means the body spills onto other lines (a bare unbraced body on
-    the next line, or a compound body whose contents start on later
-    lines) -- e.g. ``for (k = 0; k < n; k++) {`` followed by a
+    False means some part spills onto other lines (a bare unbraced body
+    on the next line, a compound body whose contents start on later
+    lines, or -- the case that matters most here -- an ``if`` whose bare
+    body sits right there on the header's own line but whose ``else``
+    doesn't, e.g. ``if (tref_isnil(tri)) i = 1;`` followed by ``else {``
+    on the next line) -- e.g. ``for (k = 0; k < n; k++) {`` followed by a
     multi-statement loop body. In that case an operator mutated inside the
-    header must be rendered as *just* the header (see
-    :func:`_operator_header_text`), never by dragging the whole
-    (unrelated, unmutated) body along with it.
+    header must be rendered as *just* the header plus whatever of the body
+    genuinely shares its line (see :func:`_operator_header_text`), never
+    by dragging the rest of the (unrelated, unmutated) statement along
+    with it.
     """
     body = _control_body(node)
     if body is None:
         return True
-    if isinstance(body, c_ast.Compound):
-        items = body.block_items or []
-        if not items:
-            return _node_line(body) == target_line
-        return _node_line(body) == target_line and all(
-            _node_line(item) == target_line for item in items
-        )
-    return _node_line(body) == target_line
+    if not _statement_fits_on_line(body, target_line):
+        return False
+    if isinstance(node, c_ast.If) and node.iffalse is not None:
+        return _statement_fits_on_line(node.iffalse, target_line)
+    return True
+
+
+def _render_body_for_header(
+    gen: c_generator.CGenerator, body: Optional[c_ast.Node], target_line: int
+) -> str:
+    """Render however much of a control statement's body belongs on the
+    header's own physical line, as a suffix to append after the header
+    text -- empty if none of it does.
+
+    Three cases: the body (a bare statement, or a compound *with its
+    contents*) fits on ``target_line`` entirely, in which case it's
+    rendered in full (this is what makes ``if (tref_isnil(tri)) i = 1;``
+    keep its bare ``i = 1;`` even when the accompanying ``else`` spills
+    onto later lines, unlike the old all-or-nothing behavior that used to
+    drag the whole ``else`` along too); only a compound's opening brace
+    is on this line, its contents further down, in which case only ``{``
+    is appended (e.g. a ``for`` header followed by a multi-statement
+    loop body); or neither, in which case nothing is appended (e.g. a
+    bare ``if`` condition whose unbraced body is on the next line).
+    """
+    if body is None:
+        return ""
+    if _statement_fits_on_line(body, target_line):
+        return " " + _collapse_to_one_line(gen._generate_stmt(body))
+    if isinstance(body, c_ast.Compound) and _node_line(body) == target_line:
+        return " {"
+    return ""
 
 
 def _operator_header_text(
@@ -644,23 +689,26 @@ def _operator_header_text(
 ) -> str:
     """Render just the header of a control statement (``mutated_node``, a
     deep copy with the operator already swapped inside it) -- condition
-    (and, for ``for``, init/next) only, never the body -- appending the
-    body's opening ``{`` if and only if that brace itself sits on
-    ``target_line`` in the original, matching how the unmutated header
-    line already looks (see :func:`_header_spans_whole_statement` for why
-    the body's *contents* are never included here).
+    (and, for ``for``, init/next) plus whatever of the body belongs on
+    this same physical line (see :func:`_render_body_for_header`) --
+    never anything past it, in particular never an ``if``'s ``else``
+    clause, which by construction (see :func:`_header_spans_whole_statement`)
+    never fits on this line whenever this function is reached at all.
     """
     if isinstance(mutated_node, c_ast.If):
         cond = gen.visit(mutated_node.cond) if mutated_node.cond is not None else ""
         text = f"if ({cond})"
+        body = mutated_node.iftrue
     elif isinstance(mutated_node, c_ast.While):
         cond = gen.visit(mutated_node.cond) if mutated_node.cond is not None else ""
         text = f"while ({cond})"
+        body = mutated_node.stmt
     elif isinstance(mutated_node, c_ast.For):
         init = gen.visit(mutated_node.init) if mutated_node.init is not None else ""
         cond = gen.visit(mutated_node.cond) if mutated_node.cond is not None else ""
         nxt = gen.visit(mutated_node.next) if mutated_node.next is not None else ""
         text = f"for ({init}; {cond}; {nxt})"
+        body = mutated_node.stmt
     else:
         assert isinstance(mutated_node, c_ast.DoWhile)
         # The condition of a do/while sits at the *end* of the statement,
@@ -670,10 +718,7 @@ def _operator_header_text(
         # fallback and shouldn't normally be reached.
         return "do"
 
-    body = _control_body(mutated_node)
-    if isinstance(body, c_ast.Compound) and _node_line(body) == target_line:
-        text += " {"
-    return text
+    return text + _render_body_for_header(gen, body, target_line)
 
 
 def _find_enclosing_statement_path(
@@ -703,6 +748,30 @@ def _find_enclosing_statement_path(
     return max(ancestor_candidates, key=len) if ancestor_candidates else ()
 
 
+def _render_mutated_statement_text(
+    gen: c_generator.CGenerator,
+    unit_node: c_ast.Node,
+    unit_copy: c_ast.Node,
+    target_line: int,
+) -> str:
+    """Render the ``+`` replacement text for a mutation applied to
+    ``unit_copy`` (a deep copy of ``unit_node`` with some subexpression
+    inside it already mutated). If ``unit_node`` is an ``if``/``while``/
+    ``for``/``do`` whose body spills past ``target_line``, only the
+    header is rendered (see :func:`_operator_header_text`); otherwise the
+    whole statement is regenerated and collapsed back onto one line, the
+    same way nested statement-removal replacements are (see
+    :func:`_compute_mutated_text`). Shared by both comparison-operator
+    swapping and RHS +1/-1 mutation -- neither cares what kind of
+    mutation produced ``unit_copy``, only where it lives.
+    """
+    if isinstance(
+        unit_node, (c_ast.If, c_ast.While, c_ast.For, c_ast.DoWhile)
+    ) and not _header_spans_whole_statement(unit_node, target_line):
+        return _operator_header_text(gen, unit_copy, target_line)
+    return _collapse_to_one_line(gen._generate_stmt(unit_copy))
+
+
 def _compute_operator_mutated_text(
     gen: c_generator.CGenerator,
     ast: c_ast.FileAST,
@@ -718,12 +787,7 @@ def _compute_operator_mutated_text(
     the same list statement removal uses) that both contains this
     comparison and shares its physical source line -- the statement whose
     regenerated text corresponds to the whole line the comparison lives
-    on. If that statement is an ``if``/``while``/``for``/``do`` whose body
-    spills past this one line, only the header is rendered (see
-    :func:`_operator_header_text`); otherwise the whole statement is
-    regenerated on a private copy and collapsed back onto one line, the
-    same way nested statement-removal replacements are (see
-    :func:`_compute_mutated_text`).
+    on -- then renders it via :func:`_render_mutated_statement_text`.
     """
     target_line = _node_line(_get_by_path(ast, op_path))
     assert target_line is not None, "a comparison node always has a source location"
@@ -735,11 +799,7 @@ def _compute_operator_mutated_text(
     target_in_copy = cast(c_ast.BinaryOp, _get_by_path(unit_copy, relative_path))
     target_in_copy.op = new_op
 
-    if isinstance(
-        unit_node, (c_ast.If, c_ast.While, c_ast.For, c_ast.DoWhile)
-    ) and not _header_spans_whole_statement(unit_node, target_line):
-        return _operator_header_text(gen, unit_copy, target_line)
-    return _collapse_to_one_line(gen._generate_stmt(unit_copy))
+    return _render_mutated_statement_text(gen, unit_node, unit_copy, target_line)
 
 
 @dataclasses.dataclass
@@ -774,6 +834,118 @@ class _ReplaceOperatorApply:
         return result
 
 
+def _set_by_path(root: c_ast.Node, path: Tuple[str, ...], value: c_ast.Node) -> None:
+    """Set the node at ``path`` to ``value`` -- the write counterpart to
+    :func:`_get_by_path`. Used to swap in a whole new subtree (an
+    original expression wrapped in ``+ 1``/``- 1``) rather than mutate an
+    existing node's attribute in place, the way :func:`_unwrap_else`
+    already does for a removal-mutation's ``If``-replacement case.
+    """
+    parent = _get_by_path(root, path[:-1])
+    last = path[-1]
+    if "[" in last:
+        attr, idx = last[:-1].split("[")
+        getattr(parent, attr)[int(idx)] = value
+    else:
+        setattr(parent, last, value)
+
+
+def _find_rhs_targets(node):
+    """Yield every right-hand-side subexpression eligible for +1/-1
+    mutation under ``node`` (including ``node`` itself), depth-first in
+    source order: the value assigned by an ``Assignment`` (``k = 0`` ->
+    the ``0``, whatever the specific assignment operator), and the right
+    operand of a *comparison* ``BinaryOp`` (``k < n`` -> the ``n``).
+
+    Deliberately narrower than "every ``BinaryOp``'s right operand":
+    off-by-one on the right side of ordinary arithmetic (``a + b``,
+    ``sum * 2``) reads as a mutation of the arithmetic itself rather than
+    a boundary check, and would multiply mutants on nearly every numeric
+    expression in a file; comparisons and assignments are where an
+    off-by-one is the textbook mutation-testing move (a loop bound, an
+    initial value, a threshold).
+
+    These two cases can nest and both get visited: in ``a = b < c``, the
+    ``Assignment``'s own rvalue (the whole ``b < c``) is one target, and
+    the inner comparison's right operand (``c``) is a separate one.
+    """
+    if isinstance(node, c_ast.Assignment) and node.rvalue is not None:
+        yield node.rvalue
+    if (
+        isinstance(node, c_ast.BinaryOp)
+        and node.op in _COMPARISON_OPS
+        and node.right is not None
+    ):
+        yield node.right
+    for _name, child in node.children():
+        yield from _find_rhs_targets(child)
+
+
+def _compute_rhs_offset_mutated_text(
+    gen: c_generator.CGenerator,
+    ast: c_ast.FileAST,
+    all_paths: List[Tuple[str, ...]],
+    line_of: Dict[Tuple[str, ...], Optional[int]],
+    target_path: Tuple[str, ...],
+    delta: int,
+) -> str:
+    """Build the ``+`` replacement line for wrapping the right-hand-side
+    expression at ``target_path`` in ``(expr) + 1`` or ``(expr) - 1``.
+
+    Locates the enclosing statement exactly as :func:`_compute_operator_mutated_text`
+    does, replaces the target subtree in a private copy with a new
+    ``BinaryOp`` wrapping it, and renders via
+    :func:`_render_mutated_statement_text`.
+    """
+    target_line = _node_line(_get_by_path(ast, target_path))
+    assert target_line is not None, "an rhs target always has a source location"
+    unit_path = _find_enclosing_statement_path(
+        all_paths, line_of, target_path, target_line
+    )
+    unit_node = _get_by_path(ast, unit_path) if unit_path else ast
+
+    unit_copy = copy.deepcopy(unit_node)
+    relative_path = target_path[len(unit_path) :]
+    original_in_copy = _get_by_path(unit_copy, relative_path)
+    op = "+" if delta == 1 else "-"
+    wrapped = c_ast.BinaryOp(op, original_in_copy, c_ast.Constant("int", "1"))
+    _set_by_path(unit_copy, relative_path, wrapped)
+
+    return _render_mutated_statement_text(gen, unit_node, unit_copy, target_line)
+
+
+@dataclasses.dataclass
+class _OffsetRhsApply:
+    """Picklable ``Mutant.apply()`` implementation for wrapping a
+    right-hand-side expression in ``+ 1``/``- 1``, mirroring
+    :class:`_ReplaceOperatorApply`: re-parse the region fresh, locate the
+    target subtree by its structural path, replace it in place with a
+    new ``BinaryOp`` wrapping the original, and regenerate the region.
+    """
+
+    region: Region
+    path: Tuple[str, ...]
+    delta: int
+
+    def __call__(self, full_source: str) -> str:
+        ast, _preamble_lines, n_fake_decls, wrapped = _parse_region(self.region.code)
+        target = _get_by_path(ast, self.path)
+        op = "+" if self.delta == 1 else "-"
+        wrapped_node = c_ast.BinaryOp(op, target, c_ast.Constant("int", "1"))
+        _set_by_path(ast, self.path, wrapped_node)
+        new_region_code = _region_source(ast, n_fake_decls, wrapped)
+
+        lines = full_source.splitlines()
+        trailing_newline = full_source.endswith("\n")
+        before = lines[: self.region.start_line - 1]
+        after = lines[self.region.end_line :]
+        result_lines = before + new_region_code.splitlines() + after
+        result = "\n".join(result_lines)
+        if trailing_newline:
+            result += "\n"
+        return result
+
+
 def _unwrap_cast(node):
     """Peel off Cast wrappers, e.g. ``(void)printf(...)`` -> the FuncCall."""
     while isinstance(node, c_ast.Cast):
@@ -786,8 +958,8 @@ def _call_name(node) -> Optional[str]:
     return that function's name; otherwise None.
 
     Used by ``--keep-call``/``keep_calls`` to recognize statements like
-    ``printf("%d\\n", 1 + 2);`` or ``assert(x > 0);`` that are nothing
-    but a single call -- as opposed to a call buried inside a bigger
+    ``printf("%d\\n", 1 + 2);`` or ``log_debug(x);`` that are nothing but
+    a single call -- as opposed to a call buried inside a bigger
     statement, which statement removal would delete along with
     everything else around it anyway.
     """
@@ -1083,10 +1255,14 @@ def generate_mutants(
 
     ``keep_calls``, if given, is a set of function names; a statement
     that is nothing but a (possibly cast) call to one of them -- e.g.
-    ``printf("%d\\n", 1 + 2);`` or ``assert(x > 0);`` -- is never offered
+    ``printf("%d\\n", 1 + 2);`` or ``log_debug(x);`` -- is never offered
     as a mutant. This is how ``--keep-call`` avoids reporting that your
-    logging or assertion calls "aren't tested" when what you actually
-    want tested is the code around them.
+    logging calls "aren't tested" when what you actually want tested is
+    the code around them. It's meant for calls like these that most
+    applications never test in the first place -- not for calls like
+    ``assert(ptr != NULL);``, which *should* fail a test once mutated to
+    ``assert(ptr == NULL);``; those are exactly the kind of statement
+    this tool exists to hold accountable, so don't ``--keep-call`` them.
     """
     mutants: List[Mutant] = []
     if whole_file:
@@ -1168,6 +1344,46 @@ def generate_mutants(
                         original=original_display,
                         mutated=mutated_display,
                         _apply=_ReplaceOperatorApply(region, op_path, new_op),
+                    )
+                )
+
+        for rhs_node in _find_rhs_targets(ast):
+            rhs_path = _find_node_path(ast, rhs_node)
+            if rhs_path is None:
+                continue
+            coord_line = _node_line(rhs_node)
+            if coord_line is None:
+                continue
+            if keep_calls:
+                enclosing_path = _find_enclosing_statement_path(
+                    all_paths, line_of, rhs_path, coord_line
+                )
+                enclosing_node = (
+                    _get_by_path(ast, enclosing_path) if enclosing_path else None
+                )
+                if (
+                    enclosing_node is not None
+                    and _call_name(enclosing_node) in keep_calls
+                ):
+                    continue
+            region_local_line = coord_line - preamble_lines
+            file_line = region.start_line + region_local_line - 1
+            if whole_file and _line_excluded(file_line, excluded_ranges):
+                continue
+            original_display = _original_display(
+                region, source_lines, region_local_line, file_line
+            )
+            for delta in (1, -1):
+                mutated_display = _compute_rhs_offset_mutated_text(
+                    gen, ast, all_paths, line_of, rhs_path, delta
+                )
+                mutants.append(
+                    Mutant(
+                        file=file_path,
+                        line=file_line,
+                        original=original_display,
+                        mutated=mutated_display,
+                        _apply=_OffsetRhsApply(region, rhs_path, delta),
                     )
                 )
     if changed_lines is not None:
@@ -1708,11 +1924,18 @@ class TestExcludedRanges(unittest.TestCase):
 
 
 class TestKeepCalls(unittest.TestCase):
+    """--keep-call is for logging-style calls most applications never
+    test in the first place (``printf``, ``print_int``) -- not for
+    assertions. An ``assert(x > 0);`` should still be offered as a
+    mutant even with other calls kept, since a test *should* fail once
+    it's mutated to ``assert(x == 0);`` or similar."""
+
     SRC = textwrap.dedent(
         """\
         void demo(int x) {
           // unimut on
           printf("%d\\n", 1 + 2);
+          print_int(x);
           assert(x > 0);
           int y = x + 1;
           (void)printf("y=%d\\n", y);
@@ -1725,6 +1948,7 @@ class TestKeepCalls(unittest.TestCase):
         mutants = generate_mutants("demo.c", self.SRC)
         originals = [m.original for m in mutants]
         self.assertIn('printf("%d\\n", 1 + 2);', originals)
+        self.assertIn("print_int(x);", originals)
         self.assertIn("assert(x > 0);", originals)
 
     def test_keep_calls_excludes_matching_statements(self):
@@ -1733,14 +1957,21 @@ class TestKeepCalls(unittest.TestCase):
         self.assertNotIn('printf("%d\\n", 1 + 2);', originals)
         self.assertNotIn('(void)printf("y=%d\\n", y);', originals)
         # Untouched: not a printf call.
+        self.assertIn("print_int(x);", originals)
         self.assertIn("assert(x > 0);", originals)
         self.assertIn("int y = x + 1;", originals)
 
     def test_multiple_keep_calls(self):
-        mutants = generate_mutants("demo.c", self.SRC, keep_calls={"printf", "assert"})
+        mutants = generate_mutants(
+            "demo.c", self.SRC, keep_calls={"printf", "print_int"}
+        )
         originals = [m.original for m in mutants]
         self.assertNotIn('printf("%d\\n", 1 + 2);', originals)
-        self.assertNotIn("assert(x > 0);", originals)
+        self.assertNotIn("print_int(x);", originals)
+        # assert() is deliberately never kept in this suite: it's the
+        # canonical example of a call that *should* stay a mutation
+        # target, not a logging-style no-op.
+        self.assertIn("assert(x > 0);", originals)
         self.assertIn("int y = x + 1;", originals)
 
     def test_unrelated_call_name_has_no_effect(self):
@@ -1935,13 +2166,16 @@ class TestComparisonOperatorHeaderOnly(unittest.TestCase):
 class TestComparisonOperatorKeepCalls(unittest.TestCase):
     """--keep-call must exempt comparisons inside a kept call's own
     statement, the same way it already exempts that statement from
-    removal."""
+    removal. Demonstrated with a logging-style call (``print_int``) --
+    the kind of statement most applications never test in the first
+    place -- rather than an assertion, which should stay a mutation
+    target."""
 
     SRC = textwrap.dedent(
         """\
         void demo(int x) {
           // unimut on
-          assert(x > 0);
+          print_int(x > 0);
           int y = x + 1;
           // unimut off
         }
@@ -1954,7 +2188,7 @@ class TestComparisonOperatorKeepCalls(unittest.TestCase):
         self.assertEqual(len(op_mutants), 5)
 
     def test_keep_calls_excludes_the_comparison_too(self):
-        mutants = generate_mutants("demo.c", self.SRC, keep_calls={"assert"})
+        mutants = generate_mutants("demo.c", self.SRC, keep_calls={"print_int"})
         op_mutants = [m for m in mutants if isinstance(m._apply, _ReplaceOperatorApply)]
         self.assertEqual(op_mutants, [])
 
@@ -1981,6 +2215,289 @@ class TestOperatorMutantsArePicklable(unittest.TestCase):
         roundtripped = pickle.loads(pickle.dumps(op_mutant))
         self.assertEqual(roundtripped.apply(src), op_mutant.apply(src))
         self.assertIn("a >= b", roundtripped.apply(src))
+
+
+class TestRhsOffsetMutation(unittest.TestCase):
+    """The two motivating examples: an assignment's value and a
+    comparison's right operand each get wrapped in ``+ 1``/``- 1``."""
+
+    SRC = textwrap.dedent(
+        """\
+        int f(int n) {
+          int k;
+          // unimut on
+          for (k = 0; k < n; k++) {
+            n = n + 1;
+          }
+          // unimut off
+          return n;
+        }
+        """
+    )
+
+    def _rhs_mutants(self):
+        return [
+            m
+            for m in generate_mutants("f.c", self.SRC)
+            if isinstance(m._apply, _OffsetRhsApply)
+        ]
+
+    def test_assignment_rhs_gets_plus_and_minus_one(self):
+        variants = {m.mutated for m in self._rhs_mutants()}
+        self.assertIn("for (k = 0 + 1; k < n; k++) {", variants)
+        self.assertIn("for (k = 0 - 1; k < n; k++) {", variants)
+
+    def test_comparison_rhs_gets_plus_and_minus_one(self):
+        variants = {m.mutated for m in self._rhs_mutants()}
+        self.assertIn("for (k = 0; k < (n + 1); k++) {", variants)
+        self.assertIn("for (k = 0; k < (n - 1); k++) {", variants)
+
+    def test_exactly_two_variants_per_target(self):
+        # Three RHS targets in this snippet: the for-header's "k = 0"
+        # and "k < n", plus the body's own "n = n + 1" (whose rvalue,
+        # the whole "n + 1", is itself a target) -- two variants (+1/-1)
+        # each, six total.
+        self.assertEqual(len(self._rhs_mutants()), 6)
+
+    def test_apply_actually_changes_the_source(self):
+        for m in self._rhs_mutants():
+            with self.subTest(mutated=m.mutated):
+                mutated_source = m.apply(self.SRC)
+                if _CC:
+                    self.assertTrue(_compiles(mutated_source))
+
+
+class TestRhsOffsetMutationNested(unittest.TestCase):
+    """An assignment whose value is itself a comparison contributes two
+    independent targets: the whole comparison (as the assignment's
+    rvalue) and that comparison's own right operand."""
+
+    SRC = textwrap.dedent(
+        """\
+        int f(int a, int b) {
+          int r;
+          // unimut on
+          r = a < b;
+          // unimut off
+          return r;
+        }
+        """
+    )
+
+    def test_both_targets_found(self):
+        mutants = [
+            m
+            for m in generate_mutants("nested.c", self.SRC)
+            if isinstance(m._apply, _OffsetRhsApply)
+        ]
+        variants = {m.mutated for m in mutants if m.mutated is not None}
+        # The Assignment's rvalue is the whole "a < b" comparison.
+        self.assertIn("r = (a < b) + 1;", variants)
+        self.assertIn("r = (a < b) - 1;", variants)
+        # The comparison's own right operand is "b".
+        self.assertIn("r = a < (b + 1);", variants)
+        self.assertIn("r = a < (b - 1);", variants)
+        self.assertEqual(len(mutants), 4)
+
+
+class TestRhsOffsetMutationExcludesPlainArithmetic(unittest.TestCase):
+    """Deliberately narrower than every BinaryOp's right operand: the
+    right side of ordinary (non-comparison) arithmetic is never wrapped
+    in +1/-1, to avoid multiplying mutants on nearly every numeric
+    expression in a file."""
+
+    SRC = textwrap.dedent(
+        """\
+        int f(int a, int b) {
+          // unimut on
+          int sum = a + b;
+          int doubled = sum * 2;
+          // unimut off
+          return doubled;
+        }
+        """
+    )
+
+    def test_no_rhs_offset_mutants_for_arithmetic(self):
+        mutants = [
+            m
+            for m in generate_mutants("arith.c", self.SRC)
+            if isinstance(m._apply, _OffsetRhsApply)
+        ]
+        self.assertEqual(mutants, [])
+
+
+class TestRhsOffsetMutationHeaderOnly(unittest.TestCase):
+    """Same body-leakage concern as comparison-operator mutation: a
+    for-loop header whose body spans further lines must show only the
+    header when its init/cond is offset-mutated."""
+
+    SRC = textwrap.dedent(
+        """\
+        int sum_below(int n) {
+          int total = 0;
+          int k;
+          // unimut on
+          for (k = 0; k < n; k++) {
+            total = total + k;
+            total = total + 1;
+          }
+          // unimut off
+          return total;
+        }
+        """
+    )
+
+    def test_header_only_no_body_leakage(self):
+        mutants = [
+            m
+            for m in generate_mutants("loop.c", self.SRC)
+            if isinstance(m._apply, _OffsetRhsApply)
+        ]
+        variants = {m.mutated for m in mutants if m.mutated is not None}
+        self.assertIn("for (k = 0 + 1; k < n; k++) {", variants)
+        self.assertIn("for (k = 0; k < (n + 1); k++) {", variants)
+        # The header variants specifically must never drag in the
+        # (unrelated, unmutated) loop body -- unlike the body's own
+        # "total = total + k;"/"total = total + 1;" mutants, which
+        # legitimately mention "total" in their own right.
+        header_variants = [v for v in variants if v.startswith("for (")]
+        self.assertEqual(len(header_variants), 4)
+        for mutated in header_variants:
+            self.assertNotIn("total", mutated)
+
+    def test_apply_only_touches_the_header(self):
+        mutants = [
+            m
+            for m in generate_mutants("loop.c", self.SRC)
+            if isinstance(m._apply, _OffsetRhsApply)
+            and m.mutated == "for (k = 0 + 1; k < n; k++) {"
+        ]
+        self.assertEqual(len(mutants), 1)
+        mutated_source = mutants[0].apply(self.SRC)
+        self.assertIn("k = 0 + 1", mutated_source)
+        self.assertIn("total = total + k;", mutated_source)
+        self.assertIn("total = total + 1;", mutated_source)
+        if _CC:
+            self.assertTrue(_compiles(mutated_source))
+
+
+class TestRhsOffsetMutationBareIfWithElseOnLaterLines(unittest.TestCase):
+    """A bare (unbraced) ``if`` body sharing the header's own physical
+    line, with an ``else`` clause that spills onto later lines, is
+    neither the "whole thing fits on one line" case nor the "nothing of
+    the body is on this line" case: the mutated preview must include the
+    bare body (since it genuinely is on this line) but never the else
+    (since it isn't) -- previously this dragged the whole unrelated,
+    unmutated else clause along with it."""
+
+    SRC = textwrap.dedent(
+        """\
+        int f(int cond) {
+          int i;
+          // unimut on
+          if (cond) i = 1;
+          else {
+            i = 2;
+            i = i + 1;
+          }
+          // unimut off
+          return i;
+        }
+        """
+    )
+
+    def test_rhs_offset_shows_bare_body_but_not_else(self):
+        mutants = [
+            m
+            for m in generate_mutants("f.c", self.SRC)
+            if isinstance(m._apply, _OffsetRhsApply) and m.line == 4
+        ]
+        variants = {m.mutated for m in mutants}
+        self.assertEqual(variants, {"if (cond) i = 1 + 1;", "if (cond) i = 1 - 1;"})
+
+    def test_apply_leaves_the_else_untouched(self):
+        mutants = [
+            m
+            for m in generate_mutants("f.c", self.SRC)
+            if isinstance(m._apply, _OffsetRhsApply)
+            and m.mutated == "if (cond) i = 1 + 1;"
+        ]
+        self.assertEqual(len(mutants), 1)
+        mutated_source = mutants[0].apply(self.SRC)
+        self.assertIn("i = 1 + 1", mutated_source)
+        self.assertIn("i = 2;", mutated_source)
+        self.assertIn("i = i + 1;", mutated_source)
+        if _CC:
+            self.assertTrue(_compiles(mutated_source))
+
+
+class TestRhsOffsetMutationKeepCalls(unittest.TestCase):
+    """--keep-call must exempt an rhs sitting inside a kept call's own
+    statement, the same way it already exempts that statement from
+    removal and from comparison-operator mutation. Demonstrated with a
+    logging-style call (``print_int``) -- the kind of statement most
+    applications never test in the first place -- rather than an
+    assertion, which should stay a mutation target."""
+
+    SRC = textwrap.dedent(
+        """\
+        void demo(int x) {
+          // unimut on
+          print_int(x < 10);
+          int y = 0;
+          y = x;
+          // unimut off
+        }
+        """
+    )
+
+    def test_no_keep_calls_mutates_the_rhs(self):
+        mutants = [
+            m
+            for m in generate_mutants("demo.c", self.SRC)
+            if isinstance(m._apply, _OffsetRhsApply)
+        ]
+        variants = {m.mutated for m in mutants if m.mutated is not None}
+        self.assertIn("print_int(x < (10 + 1));", variants)
+        self.assertIn("print_int(x < (10 - 1));", variants)
+
+    def test_keep_calls_excludes_the_rhs_too(self):
+        mutants = generate_mutants("demo.c", self.SRC, keep_calls={"print_int"})
+        rhs_mutants = [m for m in mutants if isinstance(m._apply, _OffsetRhsApply)]
+        variants = {m.mutated for m in rhs_mutants}
+        self.assertNotIn("print_int(x < (10 + 1));", variants)
+        self.assertNotIn("print_int(x < (10 - 1));", variants)
+        # The unrelated "y = x;" assignment is untouched by keep_calls
+        # and should still be mutated.
+        self.assertIn("y = x + 1;", variants)
+        self.assertIn("y = x - 1;", variants)
+
+
+class TestRhsOffsetMutantsArePicklable(unittest.TestCase):
+    """--jobs ships mutants to worker processes via pickle; rhs
+    off-by-one mutants need to survive that roundtrip too."""
+
+    def test_rhs_offset_mutant_survives_pickle_roundtrip(self):
+        import pickle
+
+        src = textwrap.dedent(
+            """\
+            int cmp(int a, int b) {
+              // unimut on
+              if (a < b) return 1;
+              return 0;
+              // unimut off
+            }
+            """
+        )
+        mutants = generate_mutants("cmp.c", src)
+        rhs_mutant = next(
+            m for m in mutants if m.mutated == "if (a < (b + 1)) return 1;"
+        )
+        roundtripped = pickle.loads(pickle.dumps(rhs_mutant))
+        self.assertEqual(roundtripped.apply(src), rhs_mutant.apply(src))
+        self.assertIn("a < (b + 1)", roundtripped.apply(src))
 
 
 class TestUnparsableRegionRaises(unittest.TestCase):

@@ -103,7 +103,7 @@ While mutants run, a live `n/m survived · ETA` line updates in place (spinner i
 | `--whole-file` | nightly-audit mode (see above) |
 | `--jobs N` | run N mutants at a time, each in its own isolated process (default: 1) |
 | `--timeout SECONDS` | kill (and silently treat as killed) any mutant whose `--run` exceeds this many seconds; a baseline timeout is an error instead (default: 10) |
-| `--keep-call NAME` | never remove a statement that's just a call to `NAME` (e.g. `--keep-call printf --keep-call assert`); repeatable |
+| `--keep-call NAME` | never remove a statement that's just a call to `NAME` (e.g. `--keep-call printf --keep-call print_int`), so logging calls most applications never test don't get reported as untested -- not meant for assertions, which should stay a mutation target; repeatable |
 | `--print-mutant-counts` | print how many mutants would be tried, and exit |
 | `--include-killed-mutants` | also print killed mutants, not just survivors |
 

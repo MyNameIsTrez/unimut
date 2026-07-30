@@ -35,8 +35,12 @@ marker-inverted exclusions as ``--whole-file`` if markers are present.
 
 ``--keep-call NAME`` (repeatable) tells unimut never to propose removing
 a statement that is nothing but a call to ``NAME`` -- e.g.
-``--keep-call printf --keep-call assert`` stops it from reporting your
-logging and assertion calls as "untested".
+``--keep-call printf --keep-call print_int`` stops it from reporting
+your logging calls as "untested", since most applications never test
+those in the first place. It's not meant for assertions: a statement
+like ``assert(ptr != NULL);`` *should* still be offered as a mutant
+(and fail your test once mutated to ``assert(ptr == NULL);``) -- that's
+exactly the kind of code this tool exists to hold accountable.
 
 ``--timeout SECONDS`` (default 10) bounds how long any single ``--run``
 invocation gets. A mutant that hangs past it (e.g. one that turned a
@@ -702,8 +706,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="keep_call",
         help=(
             "never propose removing a statement that is just a call to "
-            "NAME (e.g. --keep-call printf --keep-call assert), so "
-            "logging/assertion calls don't get reported as untested; "
+            "NAME (e.g. --keep-call printf --keep-call print_int), so "
+            "logging calls don't get reported as untested; not meant "
+            "for assertions, which should stay a mutation target; "
             "repeatable"
         ),
     )

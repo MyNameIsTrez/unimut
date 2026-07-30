@@ -16,11 +16,14 @@ real LuaJIT semantics, it exists purely so every generated mutant
 turns the report into a plain enumeration of every mutant unimut finds
 in this function: the 44 statement-removal candidates -- the same count
 as the README's own ``recff_unpack`` example (``Survived: 2/44``, there
-run against a real test suite, before operator mutation existed) -- plus
-20 more from swapping each of this function's four comparisons
+run against a real test suite, before operator/rhs mutation existed) --
+plus 20 from swapping each of this function's four comparisons
 (``i > e``, ``maxn <= 0``, ``span >= (uint32_t)maxn``, ``k < n``) into
-each of the other five comparison operators, for 64 total. Which is what
-gets diffed against ``EXPECTED_REPORT`` below.
+each of the other five comparison operators, plus 34 more from wrapping
+every assignment's value and every comparison's right operand in
+``+ 1``/``- 1`` (17 such targets throughout the function, two variants
+each), for 98 total. Which is what gets diffed against
+``EXPECTED_REPORT`` below.
 
 If a future change to ``mutate_c``'s parsing heuristics or statement
 walk ever adds, drops, or reorders a candidate for this real-world
@@ -357,7 +360,143 @@ EXPECTED_REPORT = textwrap.dedent(
     - for (k = 0; k < n; k++) {
     + for (k = 0; k >= n; k++) {
 
-    Survived: 64/64
+    lj_ffrecord.c:12
+    - t = tabV(&rd->argv[0]);
+    + t = tabV(&rd->argv[0]) + 1;
+
+    lj_ffrecord.c:12
+    - t = tabV(&rd->argv[0]);
+    + t = tabV(&rd->argv[0]) - 1;
+
+    lj_ffrecord.c:13
+    - if (tref_isnil(tri)) i = 1;
+    + if (tref_isnil(tri)) i = 1 + 1;
+
+    lj_ffrecord.c:13
+    - if (tref_isnil(tri)) i = 1;
+    + if (tref_isnil(tri)) i = 1 - 1;
+
+    lj_ffrecord.c:15
+    - i = argv2int(J, &rd->argv[1]);
+    + i = argv2int(J, &rd->argv[1]) + 1;
+
+    lj_ffrecord.c:15
+    - i = argv2int(J, &rd->argv[1]);
+    + i = argv2int(J, &rd->argv[1]) - 1;
+
+    lj_ffrecord.c:20
+    - e = argv2int(J, &rd->argv[2]);
+    + e = argv2int(J, &rd->argv[2]) + 1;
+
+    lj_ffrecord.c:20
+    - e = argv2int(J, &rd->argv[2]);
+    + e = argv2int(J, &rd->argv[2]) - 1;
+
+    lj_ffrecord.c:25
+    - e = (int32_t)lj_tab_len(t);
+    + e = ((int32_t) lj_tab_len(t)) + 1;
+
+    lj_ffrecord.c:25
+    - e = (int32_t)lj_tab_len(t);
+    + e = ((int32_t) lj_tab_len(t)) - 1;
+
+    lj_ffrecord.c:28
+    - if (i > e) { rd->nres = 0; return; }
+    + if (i > (e + 1)) { rd->nres = 0; return; }
+
+    lj_ffrecord.c:28
+    - if (i > e) { rd->nres = 0; return; }
+    + if (i > (e - 1)) { rd->nres = 0; return; }
+
+    lj_ffrecord.c:28
+    - if (i > e) { rd->nres = 0; return; }
+    + if (i > e) { rd->nres = 0 + 1; return; }
+
+    lj_ffrecord.c:28
+    - if (i > e) { rd->nres = 0; return; }
+    + if (i > e) { rd->nres = 0 - 1; return; }
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn <= (0 + 1)) || (span >= ((uint32_t) maxn)))
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn <= (0 - 1)) || (span >= ((uint32_t) maxn)))
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn <= 0) || (span >= (((uint32_t) maxn) + 1)))
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn <= 0) || (span >= (((uint32_t) maxn) - 1)))
+
+    lj_ffrecord.c:34
+    - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
+    + ix.tab = trtab + 1;
+
+    lj_ffrecord.c:34
+    - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
+    + ix.tab = trtab - 1;
+
+    lj_ffrecord.c:34
+    - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
+    + ix.idxchain = 0 + 1;
+
+    lj_ffrecord.c:34
+    - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
+    + ix.idxchain = 0 - 1;
+
+    lj_ffrecord.c:34
+    - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
+    + ix.val = 0 + 1;
+
+    lj_ffrecord.c:34
+    - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
+    + ix.val = 0 - 1;
+
+    lj_ffrecord.c:36
+    - rd->nres = n;
+    + rd->nres = n + 1;
+
+    lj_ffrecord.c:36
+    - rd->nres = n;
+    + rd->nres = n - 1;
+
+    lj_ffrecord.c:37
+    - for (k = 0; k < n; k++) {
+    + for (k = 0 + 1; k < n; k++) {
+
+    lj_ffrecord.c:37
+    - for (k = 0; k < n; k++) {
+    + for (k = 0 - 1; k < n; k++) {
+
+    lj_ffrecord.c:37
+    - for (k = 0; k < n; k++) {
+    + for (k = 0; k < (n + 1); k++) {
+
+    lj_ffrecord.c:37
+    - for (k = 0; k < n; k++) {
+    + for (k = 0; k < (n - 1); k++) {
+
+    lj_ffrecord.c:38
+    - ix.key = lj_ir_kint(J, i + k);
+    + ix.key = lj_ir_kint(J, i + k) + 1;
+
+    lj_ffrecord.c:38
+    - ix.key = lj_ir_kint(J, i + k);
+    + ix.key = lj_ir_kint(J, i + k) - 1;
+
+    lj_ffrecord.c:40
+    - J->base[k] = lj_record_idx(J, &ix);
+    + J->base[k] = lj_record_idx(J, &ix) + 1;
+
+    lj_ffrecord.c:40
+    - J->base[k] = lj_record_idx(J, &ix);
+    + J->base[k] = lj_record_idx(J, &ix) - 1;
+
+    Survived: 98/98
     """
 )
 
@@ -408,7 +547,7 @@ class TestRecffUnpackMutantList(unittest.TestCase):
             self.fail(f"mutant report for recff_unpack differs:\n{diff}")
 
         # --run true never fails, so nothing gets killed: every one of
-        # the 64 mutants "survives", which is also why the exit code is
+        # the 98 mutants "survives", which is also why the exit code is
         # 1 here (unimut's CLI convention: nonzero iff something
         # survived) rather than a sign anything is actually wrong.
         self.assertEqual(self.exit_code, 1)
