@@ -106,6 +106,7 @@ While mutants run, a live `n/m survived · ETA` line updates in place (spinner i
 | `--keep-call NAME` | never remove a statement that's just a call to `NAME` (e.g. `--keep-call printf --keep-call print_int`), so logging calls most applications never test don't get reported as untested -- not meant for assertions, which should stay a mutation target; repeatable |
 | `--print-mutant-counts` | print how many mutants would be tried, and exit |
 | `--include-killed-mutants` | also print killed mutants, not just survivors |
+| `--exit-on-first-survivor` | stop as soon as any mutant survives instead of running the rest -- for fast local iteration |
 
 ### A note on "ignored" compile failures
 

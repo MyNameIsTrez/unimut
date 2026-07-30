@@ -48,6 +48,13 @@ loop infinite) is killed and silently treated as killed, same as any
 other non-surviving mutant; a baseline that times out is reported as an
 error instead, same as any other baseline failure.
 
+``--exit-on-first-survivor`` stops the whole run the moment any mutant
+survives, rather than working through the rest. The full run still
+tells you *everything* that's under-tested, but while iterating locally
+you often just want to know "is there a gap at all" as fast as
+possible; this skips (and, with ``--jobs`` > 1, cancels whatever's
+already in flight for) every mutant after the first survivor.
+
 unimut never mutates ``--file`` in place. It always copies the whole
 repository (as reported by ``git rev-parse --show-toplevel``, or the
 current directory if that isn't a git checkout) into an isolated temp
@@ -490,17 +497,27 @@ def _run_mutants(
     jobs: int,
     repo_root: Path,
     timeout_seconds: float,
-) -> Tuple[bool, str, List[MutantResult]]:
+    exit_on_first_survivor: bool = False,
+) -> Tuple[bool, str, List[MutantResult], bool]:
     """Run a baseline check plus every mutant across ``jobs`` worker processes.
 
-    Returns ``(baseline_survived, baseline_output, results)``. The
-    baseline is a single extra unit of work -- "build/test the code with
+    Returns ``(baseline_survived, baseline_output, results, stopped_early)``.
+    The baseline is a single extra unit of work -- "build/test the code with
     no mutation applied" -- sharing the same worker pool as the mutants,
     so it runs *alongside* them rather than serially in front of them.
     If it comes back failing, that means ``--run`` doesn't even pass
     against unmodified code, so no mutant result can be trusted; unimut
     kills every worker immediately and returns with ``results`` empty,
     rather than finishing a run whose conclusions would be meaningless.
+
+    If ``exit_on_first_survivor`` is True, the moment any mutant comes
+    back survived, unimut stops the same way: kills every worker
+    immediately rather than waiting for whatever's still in flight, and
+    returns whatever results had already come in (``stopped_early`` is
+    True in this case, and only in this case -- a normal completed run,
+    even one with survivors, reports False). This is for fast local
+    iteration, where finding out about the *first* gap is enough to go
+    fix something without waiting through however many mutants remain.
 
     ``timeout_seconds`` (from ``--timeout``) is passed straight through
     to each worker; see :func:`_worker_main` for what happens on a
@@ -568,6 +585,7 @@ def _run_mutants(
     baseline_output = ""
     baseline_done = False
     completed_mutants = 0
+    stopped_early = False
 
     def _cleanup(kill: bool) -> None:
         if kill:
@@ -606,17 +624,22 @@ def _run_mutants(
                 results[idx] = MutantResult(mutants[idx], survived)
                 progress.record(survived)
                 completed_mutants += 1
+                if survived and exit_on_first_survivor:
+                    # Found what --exit-on-first-survivor is looking
+                    # for -- no point running (or finishing) the rest.
+                    stopped_early = True
+                    break
     except BaseException:
         progress.stop()
         _cleanup(kill=True)
         raise
     else:
         progress.stop()
-        _cleanup(kill=not baseline_survived)
+        _cleanup(kill=not baseline_survived or stopped_early)
 
     if not baseline_survived:
-        return False, baseline_output, []
-    return True, "", [r for r in results if r is not None]
+        return False, baseline_output, [], False
+    return True, "", [r for r in results if r is not None], stopped_early
 
 
 def _print_report(
@@ -676,6 +699,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--include-killed-mutants",
         action="store_true",
         help="also show mutants that were killed (--run failed), not just survivors",
+    )
+    parser.add_argument(
+        "--exit-on-first-survivor",
+        action="store_true",
+        dest="exit_on_first_survivor",
+        help=(
+            "stop as soon as any mutant survives, instead of running the "
+            "rest -- for fast local iteration, once you just want to "
+            "know there's a gap rather than the full exhaustive count"
+        ),
     )
     parser.add_argument(
         "--diff",
@@ -830,7 +863,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     repo_root = _git_repo_root(file_path.resolve().parent) or Path.cwd()
     try:
-        baseline_survived, baseline_output, results = _run_mutants(
+        baseline_survived, baseline_output, results, stopped_early = _run_mutants(
             file_path,
             original_source,
             mutants,
@@ -838,6 +871,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.jobs,
             repo_root,
             args.timeout,
+            args.exit_on_first_survivor,
         )
     except KeyboardInterrupt:
         print("\nunimut: cancelled", file=sys.stderr)
@@ -854,6 +888,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(file=sys.stderr)
             print(baseline_output, file=sys.stderr, end="")
         return 1
+
+    if stopped_early:
+        skipped = len(mutants) - len(results)
+        print(
+            "unimut: a mutant survived -- stopping early "
+            f"(--exit-on-first-survivor; {skipped} mutant"
+            f"{'s' if skipped != 1 else ''} not run)",
+            file=sys.stderr,
+        )
 
     color = _use_color(sys.stdout)
     return _print_report(results, args.include_killed_mutants, color)
