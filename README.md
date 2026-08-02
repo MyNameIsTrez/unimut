@@ -7,6 +7,8 @@
 - A mutant your tests catch (`--run` fails) is **killed** -- the good outcome, and hidden by default.
 - A mutant your tests miss (`--run` still exits 0) **survived** -- a sign you're missing a test -- and gets printed.
 
+Every mutant changes exactly one thing -- one statement removed, one operator swapped, one constant nudged -- never several at once. This is what keeps `unimut` computationally feasible at all: the mutant count grows linearly with the number of mutation sites, not combinatorially with every possible combination of them (which would be 2^n for n independent single-point mutants -- intractable past a handful of lines). It also keeps every survivor legible: when a mutant survives, you know precisely which one-line change your tests failed to notice, rather than being left to guess which part of a bundle of simultaneous changes was the one that mattered, or whether two changes happened to cancel each other out. The known gap this leaves is *coupling failure* -- two simultaneous faults that mask each other, which no single-mutation test could ever catch even with full first-order coverage -- but mutation testing's "coupling effect" hypothesis (tests that catch simple faults tend to also catch complex ones built from them) is why tools converge on first-order mutation anyway: it captures most of the signal for a small fraction of the cost.
+
 ```diff
 $ unimut --file src/lj_ffrecord.c --run 'make -j$(nproc) && PATH="$PWD/src:$PATH" perl t/unpack.t'
 
