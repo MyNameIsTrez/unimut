@@ -19,10 +19,11 @@ as the README's own ``recff_unpack`` example (``Survived: 2/44``, there
 run against a real test suite, before operator/rhs mutation existed) --
 plus 20 from swapping each of this function's four comparisons
 (``i > e``, ``maxn <= 0``, ``span >= (uint32_t)maxn``, ``k < n``) into
-each of the other five comparison operators, plus 34 more from wrapping
-every assignment's value and every comparison's right operand in
-``+ 1``/``- 1`` (17 such targets throughout the function, two variants
-each), for 98 total. Which is what gets diffed against
+each of the other five comparison operators, plus 82 more from wrapping
+every assignment's value -- and every subexpression nested inside it --
+and every comparison's right operand in ``+ 1``/``- 1`` (41 such targets
+throughout the function, two variants each), for 146 total. Which is
+what gets diffed against
 ``EXPECTED_REPORT`` below.
 
 If a future change to ``mutate_c``'s parsing heuristics or statement
@@ -368,6 +369,38 @@ EXPECTED_REPORT = textwrap.dedent(
     - t = tabV(&rd->argv[0]);
     + t = tabV(&rd->argv[0]) - 1;
 
+    lj_ffrecord.c:12
+    - t = tabV(&rd->argv[0]);
+    + t = tabV((&rd->argv[0]) + 1);
+
+    lj_ffrecord.c:12
+    - t = tabV(&rd->argv[0]);
+    + t = tabV((&rd->argv[0]) - 1);
+
+    lj_ffrecord.c:12
+    - t = tabV(&rd->argv[0]);
+    + t = tabV(&(rd->argv[0] + 1));
+
+    lj_ffrecord.c:12
+    - t = tabV(&rd->argv[0]);
+    + t = tabV(&(rd->argv[0] - 1));
+
+    lj_ffrecord.c:12
+    - t = tabV(&rd->argv[0]);
+    + t = tabV(&(rd->argv + 1)[0]);
+
+    lj_ffrecord.c:12
+    - t = tabV(&rd->argv[0]);
+    + t = tabV(&(rd->argv - 1)[0]);
+
+    lj_ffrecord.c:12
+    - t = tabV(&rd->argv[0]);
+    + t = tabV(&rd->argv[0 + 1]);
+
+    lj_ffrecord.c:12
+    - t = tabV(&rd->argv[0]);
+    + t = tabV(&rd->argv[0 - 1]);
+
     lj_ffrecord.c:13
     - if (tref_isnil(tri)) i = 1;
     + if (tref_isnil(tri)) i = 1 + 1;
@@ -384,6 +417,46 @@ EXPECTED_REPORT = textwrap.dedent(
     - i = argv2int(J, &rd->argv[1]);
     + i = argv2int(J, &rd->argv[1]) - 1;
 
+    lj_ffrecord.c:15
+    - i = argv2int(J, &rd->argv[1]);
+    + i = argv2int(J + 1, &rd->argv[1]);
+
+    lj_ffrecord.c:15
+    - i = argv2int(J, &rd->argv[1]);
+    + i = argv2int(J - 1, &rd->argv[1]);
+
+    lj_ffrecord.c:15
+    - i = argv2int(J, &rd->argv[1]);
+    + i = argv2int(J, (&rd->argv[1]) + 1);
+
+    lj_ffrecord.c:15
+    - i = argv2int(J, &rd->argv[1]);
+    + i = argv2int(J, (&rd->argv[1]) - 1);
+
+    lj_ffrecord.c:15
+    - i = argv2int(J, &rd->argv[1]);
+    + i = argv2int(J, &(rd->argv[1] + 1));
+
+    lj_ffrecord.c:15
+    - i = argv2int(J, &rd->argv[1]);
+    + i = argv2int(J, &(rd->argv[1] - 1));
+
+    lj_ffrecord.c:15
+    - i = argv2int(J, &rd->argv[1]);
+    + i = argv2int(J, &(rd->argv + 1)[1]);
+
+    lj_ffrecord.c:15
+    - i = argv2int(J, &rd->argv[1]);
+    + i = argv2int(J, &(rd->argv - 1)[1]);
+
+    lj_ffrecord.c:15
+    - i = argv2int(J, &rd->argv[1]);
+    + i = argv2int(J, &rd->argv[1 + 1]);
+
+    lj_ffrecord.c:15
+    - i = argv2int(J, &rd->argv[1]);
+    + i = argv2int(J, &rd->argv[1 - 1]);
+
     lj_ffrecord.c:20
     - e = argv2int(J, &rd->argv[2]);
     + e = argv2int(J, &rd->argv[2]) + 1;
@@ -392,6 +465,46 @@ EXPECTED_REPORT = textwrap.dedent(
     - e = argv2int(J, &rd->argv[2]);
     + e = argv2int(J, &rd->argv[2]) - 1;
 
+    lj_ffrecord.c:20
+    - e = argv2int(J, &rd->argv[2]);
+    + e = argv2int(J + 1, &rd->argv[2]);
+
+    lj_ffrecord.c:20
+    - e = argv2int(J, &rd->argv[2]);
+    + e = argv2int(J - 1, &rd->argv[2]);
+
+    lj_ffrecord.c:20
+    - e = argv2int(J, &rd->argv[2]);
+    + e = argv2int(J, (&rd->argv[2]) + 1);
+
+    lj_ffrecord.c:20
+    - e = argv2int(J, &rd->argv[2]);
+    + e = argv2int(J, (&rd->argv[2]) - 1);
+
+    lj_ffrecord.c:20
+    - e = argv2int(J, &rd->argv[2]);
+    + e = argv2int(J, &(rd->argv[2] + 1));
+
+    lj_ffrecord.c:20
+    - e = argv2int(J, &rd->argv[2]);
+    + e = argv2int(J, &(rd->argv[2] - 1));
+
+    lj_ffrecord.c:20
+    - e = argv2int(J, &rd->argv[2]);
+    + e = argv2int(J, &(rd->argv + 1)[2]);
+
+    lj_ffrecord.c:20
+    - e = argv2int(J, &rd->argv[2]);
+    + e = argv2int(J, &(rd->argv - 1)[2]);
+
+    lj_ffrecord.c:20
+    - e = argv2int(J, &rd->argv[2]);
+    + e = argv2int(J, &rd->argv[2 + 1]);
+
+    lj_ffrecord.c:20
+    - e = argv2int(J, &rd->argv[2]);
+    + e = argv2int(J, &rd->argv[2 - 1]);
+
     lj_ffrecord.c:25
     - e = (int32_t)lj_tab_len(t);
     + e = ((int32_t) lj_tab_len(t)) + 1;
@@ -399,6 +512,22 @@ EXPECTED_REPORT = textwrap.dedent(
     lj_ffrecord.c:25
     - e = (int32_t)lj_tab_len(t);
     + e = ((int32_t) lj_tab_len(t)) - 1;
+
+    lj_ffrecord.c:25
+    - e = (int32_t)lj_tab_len(t);
+    + e = (int32_t) (lj_tab_len(t) + 1);
+
+    lj_ffrecord.c:25
+    - e = (int32_t)lj_tab_len(t);
+    + e = (int32_t) (lj_tab_len(t) - 1);
+
+    lj_ffrecord.c:25
+    - e = (int32_t)lj_tab_len(t);
+    + e = (int32_t) lj_tab_len(t + 1);
+
+    lj_ffrecord.c:25
+    - e = (int32_t)lj_tab_len(t);
+    + e = (int32_t) lj_tab_len(t - 1);
 
     lj_ffrecord.c:28
     - if (i > e) { rd->nres = 0; return; }
@@ -431,6 +560,14 @@ EXPECTED_REPORT = textwrap.dedent(
     lj_ffrecord.c:31
     - if (maxn <= 0 || span >= (uint32_t)maxn)
     + if ((maxn <= 0) || (span >= (((uint32_t) maxn) - 1)))
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn <= 0) || (span >= ((uint32_t) (maxn + 1))))
+
+    lj_ffrecord.c:31
+    - if (maxn <= 0 || span >= (uint32_t)maxn)
+    + if ((maxn <= 0) || (span >= ((uint32_t) (maxn - 1))))
 
     lj_ffrecord.c:34
     - ix.tab = trtab; ix.idxchain = 0; ix.val = 0;
@@ -488,6 +625,38 @@ EXPECTED_REPORT = textwrap.dedent(
     - ix.key = lj_ir_kint(J, i + k);
     + ix.key = lj_ir_kint(J, i + k) - 1;
 
+    lj_ffrecord.c:38
+    - ix.key = lj_ir_kint(J, i + k);
+    + ix.key = lj_ir_kint(J + 1, i + k);
+
+    lj_ffrecord.c:38
+    - ix.key = lj_ir_kint(J, i + k);
+    + ix.key = lj_ir_kint(J - 1, i + k);
+
+    lj_ffrecord.c:38
+    - ix.key = lj_ir_kint(J, i + k);
+    + ix.key = lj_ir_kint(J, (i + k) + 1);
+
+    lj_ffrecord.c:38
+    - ix.key = lj_ir_kint(J, i + k);
+    + ix.key = lj_ir_kint(J, (i + k) - 1);
+
+    lj_ffrecord.c:38
+    - ix.key = lj_ir_kint(J, i + k);
+    + ix.key = lj_ir_kint(J, (i + 1) + k);
+
+    lj_ffrecord.c:38
+    - ix.key = lj_ir_kint(J, i + k);
+    + ix.key = lj_ir_kint(J, (i - 1) + k);
+
+    lj_ffrecord.c:38
+    - ix.key = lj_ir_kint(J, i + k);
+    + ix.key = lj_ir_kint(J, i + (k + 1));
+
+    lj_ffrecord.c:38
+    - ix.key = lj_ir_kint(J, i + k);
+    + ix.key = lj_ir_kint(J, i + (k - 1));
+
     lj_ffrecord.c:40
     - J->base[k] = lj_record_idx(J, &ix);
     + J->base[k] = lj_record_idx(J, &ix) + 1;
@@ -496,7 +665,31 @@ EXPECTED_REPORT = textwrap.dedent(
     - J->base[k] = lj_record_idx(J, &ix);
     + J->base[k] = lj_record_idx(J, &ix) - 1;
 
-    Survived: 98/98
+    lj_ffrecord.c:40
+    - J->base[k] = lj_record_idx(J, &ix);
+    + J->base[k] = lj_record_idx(J + 1, &ix);
+
+    lj_ffrecord.c:40
+    - J->base[k] = lj_record_idx(J, &ix);
+    + J->base[k] = lj_record_idx(J - 1, &ix);
+
+    lj_ffrecord.c:40
+    - J->base[k] = lj_record_idx(J, &ix);
+    + J->base[k] = lj_record_idx(J, (&ix) + 1);
+
+    lj_ffrecord.c:40
+    - J->base[k] = lj_record_idx(J, &ix);
+    + J->base[k] = lj_record_idx(J, (&ix) - 1);
+
+    lj_ffrecord.c:40
+    - J->base[k] = lj_record_idx(J, &ix);
+    + J->base[k] = lj_record_idx(J, &(ix + 1));
+
+    lj_ffrecord.c:40
+    - J->base[k] = lj_record_idx(J, &ix);
+    + J->base[k] = lj_record_idx(J, &(ix - 1));
+
+    Survived: 146/146
     """
 )
 
@@ -547,7 +740,7 @@ class TestRecffUnpackMutantList(unittest.TestCase):
             self.fail(f"mutant report for recff_unpack differs:\n{diff}")
 
         # --run true never fails, so nothing gets killed: every one of
-        # the 98 mutants "survives", which is also why the exit code is
+        # the 146 mutants "survives", which is also why the exit code is
         # 1 here (unimut's CLI convention: nonzero iff something
         # survived) rather than a sign anything is actually wrong.
         self.assertEqual(self.exit_code, 1)

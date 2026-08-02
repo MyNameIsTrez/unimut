@@ -886,12 +886,68 @@ def _set_by_path(root: c_ast.Node, path: Tuple[str, ...], value: c_ast.Node) -> 
         setattr(parent, last, value)
 
 
+def _iter_subexpressions(node: c_ast.Node):
+    """Yield ``node`` itself, then recursively every expression nested
+    inside it, so a compound expression offers one +1/-1 candidate per
+    node in its tree rather than just one for the expression as a whole.
+
+    For example, given ``2 * foo`` this yields the whole ``2 * foo``
+    first, then ``2``, then ``foo`` -- so the mutants offered end up
+    being ``(2 * foo) + 1``, ``(2 + 1) * foo``, and ``2 * (foo + 1)``
+    (and their ``- 1`` counterparts), not just the first of those.
+    Terminals (a bare ``ID`` or ``Constant``) are yielded too, since
+    they have nothing further to recurse into but are still eligible
+    for wrapping in their own right.
+
+    Deliberately narrow about which attribute of each node type counts
+    as "nested inside it" for this purpose: an ``Assignment``'s
+    ``lvalue`` (what's being assigned *to*), a ``StructRef``'s field
+    name, and a ``FuncCall``'s own callee expression aren't really
+    *subexpressions* of a value the way operands of an operator are, so
+    those are left alone even where pycparser happens to represent them
+    as ordinary expression nodes. Whether a resulting mutant still
+    type-checks is not this function's concern -- the caller wraps
+    whatever it's given in ``(expr) + 1``/``(expr) - 1`` regardless, and
+    a mutant is free to no longer compile.
+    """
+    yield node
+    if isinstance(node, c_ast.BinaryOp):
+        yield from _iter_subexpressions(node.left)
+        yield from _iter_subexpressions(node.right)
+    elif isinstance(node, c_ast.UnaryOp):
+        yield from _iter_subexpressions(node.expr)
+    elif isinstance(node, c_ast.TernaryOp):
+        yield from _iter_subexpressions(node.cond)
+        yield from _iter_subexpressions(node.iftrue)
+        yield from _iter_subexpressions(node.iffalse)
+    elif isinstance(node, c_ast.Cast):
+        yield from _iter_subexpressions(node.expr)
+    elif isinstance(node, c_ast.Assignment):
+        if node.rvalue is not None:
+            yield from _iter_subexpressions(node.rvalue)
+    elif isinstance(node, c_ast.FuncCall):
+        if node.args is not None:
+            for arg in node.args.exprs:
+                yield from _iter_subexpressions(arg)
+    elif isinstance(node, c_ast.ArrayRef):
+        yield from _iter_subexpressions(node.name)
+        yield from _iter_subexpressions(node.subscript)
+    elif isinstance(node, c_ast.ExprList):
+        for expr in node.exprs:
+            yield from _iter_subexpressions(expr)
+    # ID, Constant, and anything else not listed above (a StructRef's
+    # own field name, a FuncCall's callee, ...) are leaves for this
+    # walk: yielded above (if reached at all), nothing further to do.
+
+
 def _find_rhs_targets(node):
     """Yield every right-hand-side subexpression eligible for +1/-1
     mutation under ``node`` (including ``node`` itself), depth-first in
     source order: the value assigned by an ``Assignment`` (``k = 0`` ->
-    the ``0``, whatever the specific assignment operator), and the right
-    operand of a *comparison* ``BinaryOp`` (``k < n`` -> the ``n``).
+    the ``0``, whatever the specific assignment operator) and everything
+    nested inside that value, and the right operand of a *comparison*
+    ``BinaryOp`` (``k < n`` -> the ``n``) and everything nested inside
+    *that* -- see :func:`_iter_subexpressions` for the recursive part.
 
     Deliberately narrower than "every ``BinaryOp``'s right operand":
     off-by-one on the right side of ordinary arithmetic (``a + b``,
@@ -899,20 +955,28 @@ def _find_rhs_targets(node):
     a boundary check, and would multiply mutants on nearly every numeric
     expression in a file; comparisons and assignments are where an
     off-by-one is the textbook mutation-testing move (a loop bound, an
-    initial value, a threshold).
+    initial value, a threshold). Once inside an assignment's value,
+    though, every subexpression of it is fair game -- ``sum = 2 * foo``
+    offers boundary mutants on ``2``, on ``foo``, and on the product as
+    a whole, not just the last of those.
 
     These two cases can nest and both get visited: in ``a = b < c``, the
-    ``Assignment``'s own rvalue (the whole ``b < c``) is one target, and
-    the inner comparison's right operand (``c``) is a separate one.
+    ``Assignment``'s own rvalue (the whole ``b < c``, plus its own
+    nested ``b`` and ``c``) is one family of targets, and the inner
+    comparison's right operand (``c``, and anything nested inside it) is
+    visited again separately as its own family. The two families overlap
+    node-for-node in a case like this; callers are expected to dedupe by
+    structural path (as :func:`generate_mutants` does) rather than rely
+    on this generator never repeating a node.
     """
     if isinstance(node, c_ast.Assignment) and node.rvalue is not None:
-        yield node.rvalue
+        yield from _iter_subexpressions(node.rvalue)
     if (
         isinstance(node, c_ast.BinaryOp)
         and node.op in _COMPARISON_OPS
         and node.right is not None
     ):
-        yield node.right
+        yield from _iter_subexpressions(node.right)
     for _name, child in node.children():
         yield from _find_rhs_targets(child)
 
@@ -1385,10 +1449,12 @@ def generate_mutants(
                     )
                 )
 
+        seen_rhs_paths: Set[Tuple[str, ...]] = set()
         for rhs_node in _find_rhs_targets(ast):
             rhs_path = _find_node_path(ast, rhs_node)
-            if rhs_path is None:
+            if rhs_path is None or rhs_path in seen_rhs_paths:
                 continue
+            seen_rhs_paths.add(rhs_path)
             coord_line = _node_line(rhs_node)
             if coord_line is None:
                 continue
@@ -2291,11 +2357,24 @@ class TestRhsOffsetMutation(unittest.TestCase):
         self.assertIn("for (k = 0; k < (n - 1); k++) {", variants)
 
     def test_exactly_two_variants_per_target(self):
-        # Three RHS targets in this snippet: the for-header's "k = 0"
-        # and "k < n", plus the body's own "n = n + 1" (whose rvalue,
-        # the whole "n + 1", is itself a target) -- two variants (+1/-1)
-        # each, six total.
-        self.assertEqual(len(self._rhs_mutants()), 6)
+        # Five RHS targets in this snippet: the for-header's "k = 0" and
+        # "k < n", plus the body's "n = n + 1" -- whose rvalue "n + 1" is
+        # itself a target, and whose own operands ("n" and "1") are each
+        # separate targets too, since +1/-1 mutation now recurses into
+        # every subexpression of an assignment's value, not just the
+        # value as a whole. Two variants (+1/-1) each, ten total.
+        self.assertEqual(len(self._rhs_mutants()), 10)
+
+    def test_body_assignment_operands_are_also_mutated(self):
+        # "n = n + 1;" contributes mutants for the whole rvalue ("n + 1"),
+        # its left operand ("n"), and its right operand ("1") -- not just
+        # the rvalue as a whole.
+        variants = {m.mutated for m in self._rhs_mutants() if m.line == 5}
+        self.assertIn("n = (n + 1) + 1;", variants)  # whole rvalue, +1
+        self.assertIn("n = (n + 1) - 1;", variants)  # whole rvalue, -1
+        self.assertIn("n = (n - 1) + 1;", variants)  # left operand "n", -1
+        self.assertIn("n = n + (1 + 1);", variants)  # right operand "1", +1
+        self.assertIn("n = n + (1 - 1);", variants)  # right operand "1", -1
 
     def test_apply_actually_changes_the_source(self):
         for m in self._rhs_mutants():
@@ -2306,9 +2385,12 @@ class TestRhsOffsetMutation(unittest.TestCase):
 
 
 class TestRhsOffsetMutationNested(unittest.TestCase):
-    """An assignment whose value is itself a comparison contributes two
-    independent targets: the whole comparison (as the assignment's
-    rvalue) and that comparison's own right operand."""
+    """An assignment whose value is itself a comparison contributes
+    targets for the whole comparison (as the assignment's rvalue), each
+    of that comparison's own operands (since +1/-1 mutation recurses
+    into every subexpression of an assignment's value), and -- visited
+    again separately -- the comparison's own right operand as a
+    boundary check in its own right."""
 
     SRC = textwrap.dedent(
         """\
@@ -2322,7 +2404,7 @@ class TestRhsOffsetMutationNested(unittest.TestCase):
         """
     )
 
-    def test_both_targets_found(self):
+    def test_all_targets_found(self):
         mutants = [
             m
             for m in generate_mutants("nested.c", self.SRC)
@@ -2332,10 +2414,19 @@ class TestRhsOffsetMutationNested(unittest.TestCase):
         # The Assignment's rvalue is the whole "a < b" comparison.
         self.assertIn("r = (a < b) + 1;", variants)
         self.assertIn("r = (a < b) - 1;", variants)
-        # The comparison's own right operand is "b".
+        # The comparison's left operand, "a", reached via recursion into
+        # the assignment's value.
+        self.assertIn("r = (a + 1) < b;", variants)
+        self.assertIn("r = (a - 1) < b;", variants)
+        # The comparison's right operand, "b" -- reached both ways (as
+        # part of the assignment's value, and as the comparison's own
+        # boundary target), but deduped to one mutant per variant.
         self.assertIn("r = a < (b + 1);", variants)
         self.assertIn("r = a < (b - 1);", variants)
-        self.assertEqual(len(mutants), 4)
+        # Three distinct targets (the whole comparison, "a", and "b"),
+        # two variants each -- six total, not eight, since "b" is only
+        # counted once despite being reachable two ways.
+        self.assertEqual(len(mutants), 6)
 
 
 class TestRhsOffsetMutationExcludesPlainArithmetic(unittest.TestCase):
@@ -2510,6 +2601,54 @@ class TestRhsOffsetMutationKeepCalls(unittest.TestCase):
         # and should still be mutated.
         self.assertIn("y = x + 1;", variants)
         self.assertIn("y = x - 1;", variants)
+
+
+class TestRhsOffsetMutationRecursesIntoSubexpressions(unittest.TestCase):
+    """+1/-1 mutation of an assignment's value recurses into every
+    subexpression of it, not just the value as a whole: ``sum = 2 * foo``
+    offers boundary mutants on ``2``, on ``foo``, and on the product as
+    a whole. Types are irrelevant to this recursion -- a mutant is free
+    to no longer compile."""
+
+    SRC = textwrap.dedent(
+        """\
+        int f(int foo) {
+          int sum;
+          // unimut on
+          sum = 2 * foo;
+          // unimut off
+          return sum;
+        }
+        """
+    )
+
+    def _rhs_mutants(self):
+        return [
+            m
+            for m in generate_mutants("f.c", self.SRC)
+            if isinstance(m._apply, _OffsetRhsApply)
+        ]
+
+    def test_whole_product_and_both_operands_are_targets(self):
+        variants = {m.mutated for m in self._rhs_mutants()}
+        self.assertEqual(
+            variants,
+            {
+                "sum = (2 * foo) + 1;",
+                "sum = (2 * foo) - 1;",
+                "sum = (2 + 1) * foo;",
+                "sum = (2 - 1) * foo;",
+                "sum = 2 * (foo + 1);",
+                "sum = 2 * (foo - 1);",
+            },
+        )
+
+    def test_apply_actually_changes_the_source(self):
+        for m in self._rhs_mutants():
+            with self.subTest(mutated=m.mutated):
+                mutated_source = m.apply(self.SRC)
+                if _CC:
+                    self.assertTrue(_compiles(mutated_source))
 
 
 class TestRhsOffsetMutantsArePicklable(unittest.TestCase):

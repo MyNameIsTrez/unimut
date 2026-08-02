@@ -63,10 +63,12 @@ class TestExitOnFirstSurvivor(unittest.TestCase):
     def test_without_the_flag_runs_every_mutant(self):
         exit_code, stdout, _stderr = self._run_cli(["--include-killed-mutants"])
         self.assertEqual(exit_code, 1)
-        # 3 statement-removal mutants, plus 2 rhs off-by-one mutants for
-        # each assignment's own value ("a + 1", "b + 1", "c + 1" are each
-        # themselves a target) -- 9 total.
-        self.assertIn("Survived: 9/9", stdout)
+        # 3 statement-removal mutants, plus 6 rhs off-by-one mutants for
+        # each assignment ("a + 1" is a target as a whole, and so are its
+        # own operands "a" and "1", now that +1/-1 mutation recurses into
+        # every subexpression of an assignment's value -- two variants
+        # each, three targets, six mutants per assignment) -- 21 total.
+        self.assertIn("Survived: 21/21", stdout)
 
     def test_with_the_flag_stops_after_the_first_survivor(self):
         exit_code, stdout, stderr = self._run_cli(
@@ -83,8 +85,8 @@ class TestExitOnFirstSurvivor(unittest.TestCase):
         _exit_code, _stdout, stderr = self._run_cli(["--exit-on-first-survivor"])
         self.assertIn("stopping early", stderr)
         self.assertIn("--exit-on-first-survivor", stderr)
-        # 8 of the 9 total mutants were never run.
-        self.assertIn("8 mutants not run", stderr)
+        # 20 of the 21 total mutants were never run.
+        self.assertIn("20 mutants not run", stderr)
 
     def test_no_message_without_the_flag(self):
         _exit_code, _stdout, stderr = self._run_cli([])
