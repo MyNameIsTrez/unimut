@@ -126,6 +126,32 @@ Run its own test suite (hardcoded C strings, no fixture files, compiled with wha
 python -m unittest discover -s src -p "*.py" -v
 ```
 
+Currently implemented: statement removal, comparison-operator swap (`==`, `!=`, `<`, `<=`, `>`, `>=`), recursive `±1` boundary mutation on RHS subexpressions, and `else`-unwrapping.
+
+### Mutation kinds still to add
+
+**High priority**
+
+* **Boolean negation insertion (`!`)** -- wrap every boolean subexpression, one at a time and at every nesting depth, in `!`. `if (foo)` becomes `if (!foo)`; `if (foo && bar)` becomes `if (!foo && bar)`, `if (foo && !bar)`, and `if (!(foo && bar))`.
+* **Logical connector replacement (`&&` ↔ `||`)** -- same idea as the existing comparison-operator swap, one level up, for compound conditions.
+* **Bitwise/shift operator replacement (`&`, `|`, `^`, `<<`, `>>`)** -- swap each bitwise op for every other one in its class (keep shifts separate from `&`/`|`/`^`). Untouched by any current operator, and likely the single highest-value addition for bit-twiddling-heavy code like LuaJIT's tag checks, flag masks, and shift-based encoding.
+* **Arithmetic operator replacement (`+` ↔ `-`, `*` ↔ `/`, plus `%`)** -- swapping the operator between two full subexpressions (`a * b` → `a / b`), distinct from the existing `±1` *boundary* mutation on RHS values.
+* **Cast/width mutation** -- flip an explicit cast's signedness (`(uint32_t)` ↔ `(int32_t)`) or widen/narrow between fixed-width types. Directly targets the class of bug that careful overflow-safe code (e.g. computing a span as `uint32_t` specifically to dodge signed overflow) is meant to prevent.
+* **Increment/decrement mutation** -- `i++` ↔ `i--`, and separately pre ↔ post (`++i` ↔ `i++`). Cheap to generate, common bug class in loop counters and pointer walks.
+
+**Medium priority**
+
+* **Return-value mutation** -- for `return expr;`, offer `return 0;`, `return !expr` (in boolean context), or swap `expr` for another in-scope variable of compatible type.
+* **Break/continue swap** inside loops -- invisible to statement removal, since swapping the keyword rather than deleting the statement is a different failure mode.
+* **Array/pointer subscript off-by-one, independent of assignment RHS** -- the existing `±1` mutator walks RHS-of-assignment subexpressions recursively; a subscript sitting inside a function-call argument may not be reached the same way. Needs checking whether `_find_rhs_targets` already covers call arguments generally, or is scoped to assignment statements.
+
+**Low priority**
+
+* **Function-call argument swap** -- for a call with two-or-more arguments of the same declared type, swap an adjacent pair.
+* **`sizeof` argument mutation** -- swap `sizeof(X)` for `sizeof(Y)` where `Y` is another in-scope type/variable, particularly around allocation/copy sizes. More generally useful across other files than in `lj_ffrecord.c` itself.
+
+Note: logical (`&&`/`||`) and bitwise (`&`/`|`) swaps on boolean-typed (0/1) operands will often produce equivalent mutants for structural reasons (same as `k != n` vs `k < n` today) -- expect some of that noise rather than treating every survivor from these two as an actionable gap.
+
 ## Adding another language
 
 Language backends are plain modules exposing:
