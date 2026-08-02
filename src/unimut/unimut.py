@@ -215,13 +215,14 @@ def _format_eta(seconds: float) -> str:
 
 
 class _Progress:
-    """A live ``n/m survived <ETA|spinner>`` line, repainted ~10x/second.
+    """A live ``n/m run · k survived · <ETA|spinner>`` line, repainted
+    ~10x/second.
 
     Examples of what gets rendered, as a run progresses::
 
-        0/1002 survived ⠋              (no ETA yet: show the spinner)
-        1/1002 survived 1h 39m 5s      (first result in: ETA takes over)
-        1000/1002 survived 34s
+        0/1002 run · 0 survived · ⠋              (no ETA yet: show the spinner)
+        1/1002 run · 0 survived · 1h 39m 5s      (first result in: ETA takes over)
+        1000/1002 run · 3 survived · 34s
 
     :meth:`record` is called from the main thread every time a mutant
     result comes in (see ``_run_mutants``'s ``as_completed`` loop) and
@@ -284,7 +285,7 @@ class _Progress:
             remaining = max(0, self._total - completed)
             eta_seconds = remaining / rate if rate > 0 else 0
             suffix = _format_eta(eta_seconds)
-        message = f"{survived}/{self._total} survived {suffix}"
+        message = f"{completed}/{self._total} run · {survived} survived · {suffix}"
         self._stream.write(
             f"\r{_wave_text(message, self._base_hue, time.time())}{_CLEAR_LINE}"
         )
