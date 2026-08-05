@@ -2,6 +2,8 @@
 
 `unimut` (universal mutator) is a [mutation testing](https://en.wikipedia.org/wiki/Mutation_testing) tool that finds tests you are missing, built to scale across a project's whole lifecycle: a fast, precise gate on individual PRs (`--diff`), an exhaustive nightly audit of legacy code (`--whole-file`), and parallel execution across CI cores (`--jobs`) -- all from one tool, working on any language with a registered backend.
 
+![unimut recording](./assets/recording.gif)
+
 `unimut` tries mutations of your code and runs a `--run` command (typically "rebuild, then test") against each one:
 
 - A mutant your tests catch (`--run` fails) is **killed** -- the good outcome, and hidden by default.
