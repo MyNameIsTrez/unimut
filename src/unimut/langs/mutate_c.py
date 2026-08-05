@@ -51,6 +51,8 @@ from typing import Callable, Dict, List, Optional, Set, Tuple, cast
 
 from pycparser import c_ast, c_generator, c_parser
 
+from . import Mutant, MutationError
+
 MARK_START = "// unimut on"
 MARK_STOP = "// unimut off"
 
@@ -147,10 +149,6 @@ _PARAM_RE = re.compile(r"^\s*(?:const\s+)?([A-Za-z_]\w*)\s*\*{0,2}\s*[A-Za-z_]\w
 _FUNC_HEADER_RE = re.compile(r"\b\w+\s*\(([^()]*)\)\s*\{", re.MULTILINE)
 
 
-class MutationError(Exception):
-    """Raised when a region cannot be turned into mutants."""
-
-
 @dataclasses.dataclass
 class Region:
     """A single ``// unimut on`` / ``// unimut off`` block."""
@@ -160,24 +158,14 @@ class Region:
     code: str
 
 
-@dataclasses.dataclass
-class Mutant:
-    """One candidate mutation.
-
-    ``mutated`` is ``None`` for pure statement removal, since there is no
-    replacement line to show in the diff-style report. Later mutation
-    kinds (value tweaks, operator flips, ...) will populate it.
-    """
-
-    file: str
-    line: int
-    original: str
-    mutated: Optional[str]
-    _apply: Callable[[str], str] = dataclasses.field(repr=False, compare=False)
-
-    def apply(self, source: str) -> str:
-        """Return a full copy of ``source`` with this mutation applied."""
-        return self._apply(source)
+# ``Mutant`` and ``MutationError`` themselves now live in
+# ``unimut.langs`` (imported above) rather than here, so unimut's CLI
+# can catch a ``MutationError`` from *any* backend -- built-in or a
+# user's own -- with one ``except`` clause, and so every backend builds
+# its results out of the exact same ``Mutant`` shape. They're kept
+# importable from this module too (``from .mutate_c import Mutant``
+# still works) purely as a side effect of the ``from . import`` above,
+# for anything written against the pre-``langs`` layout.
 
 
 def find_regions(source: str) -> List[Region]:

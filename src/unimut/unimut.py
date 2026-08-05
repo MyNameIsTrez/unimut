@@ -80,8 +80,12 @@ whatever mutant work hasn't started yet, skips the usual report, and
 exits with the baseline's captured output instead.
 
 Language support is dispatched by file extension (or ``--lang``) to a
-separate backend module. Right now that's just ``mutate_c`` for C; see
-``_LANGUAGES`` below for how to add more.
+separate backend module, discovered automatically -- both unimut's own
+built-in backends (currently ``mutate_c`` for C and ``mutate_python``
+for Python, in ``unimut/langs/``) and any backend a user drops
+somewhere and points ``$UNIMUT_LANG_PATH`` at, with no changes to this
+file required either way. See ``unimut.langs`` for the protocol a
+backend implements and the full discovery rules.
 """
 
 from __future__ import annotations
@@ -104,41 +108,44 @@ import time
 from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
-from . import mutate_c
+from .langs import MutationError, discover_languages
 
-# Maps a --lang value to the backend module that implements it. Each
-# backend module must expose:
-#   EXTENSIONS: set[str]                          -- recognized file extensions
-#   generate_mutants(file_path, source, *, whole_file=False,
-#                     changed_lines=None, keep_calls=None) -> list[Mutant]
-# where a Mutant has .file, .line, .original, .mutated (str | None) and
-# an .apply(source) -> str method that must be picklable (--jobs ships
-# mutants to worker processes). The whole_file/changed_lines/keep_calls
-# keyword arguments are optional -- a backend that only supports
-# marker-based regions can omit them, and unimut will refuse
-# --diff/--whole-file/--keep-call for that backend with a clear error
-# rather than silently ignoring the flag.
-_LANGUAGES = {
-    "c": mutate_c,
-}
+# _LANGUAGES maps a --lang value to the backend module that implements
+# it, and is populated lazily by _get_languages() below rather than at
+# import time: see unimut.langs.discover_languages for exactly where
+# backends come from (unimut's own built-ins, plus anything found via
+# $UNIMUT_LANG_PATH) and the protocol a backend module implements. A
+# broken backend anywhere -- built-in or found via $UNIMUT_LANG_PATH --
+# makes discovery raise MutationError; main() below is what turns that
+# into a clean "unimut: error: ..." message and a non-zero exit rather
+# than a bare traceback.
+_LANGUAGES: Optional[dict] = None
 
 
-def _detect_language(file_path: Path, lang_override: Optional[str]):
+def _get_languages() -> dict:
+    global _LANGUAGES
+    if _LANGUAGES is None:
+        _LANGUAGES = discover_languages()
+    return _LANGUAGES
+
+
+def _detect_language(file_path: Path, lang_override: Optional[str], languages: dict):
     if lang_override is not None:
         try:
-            return _LANGUAGES[lang_override]
+            return languages[lang_override]
         except KeyError:
-            known = ", ".join(sorted(_LANGUAGES))
+            known = ", ".join(sorted(languages))
             raise SystemExit(
                 f"unimut: error: unknown --lang '{lang_override}' (known: {known})"
             )
     ext = file_path.suffix
-    for module in _LANGUAGES.values():
+    for module in languages.values():
         if ext in module.EXTENSIONS:
             return module
     raise SystemExit(
         f"unimut: error: cannot determine language for '{file_path}' "
-        f"(unrecognized extension '{ext}'); pass --lang to override"
+        f"(unrecognized extension '{ext}'); pass --lang to override, or "
+        "register a backend for it -- see unimut.langs"
     )
 
 
@@ -666,7 +673,7 @@ def _print_report(
     return 1 if survived_count > 0 else 0
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
+def build_arg_parser(languages: dict) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="unimut",
         description=(
@@ -687,9 +694,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--lang",
-        choices=sorted(_LANGUAGES),
+        choices=sorted(languages),
         default=None,
-        help="override language detection from --file's extension",
+        help=(
+            "override language detection from --file's extension. "
+            "Known values come from unimut's built-in backends plus "
+            "anything found via $UNIMUT_LANG_PATH -- see unimut.langs"
+        ),
     )
     parser.add_argument(
         "--print-mutant-counts",
@@ -776,7 +787,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = build_arg_parser().parse_args(argv)
+    # Discovery happens before argument parsing (it's needed for --lang's
+    # own choices), and any failure here -- a broken built-in, or a
+    # broken file on $UNIMUT_LANG_PATH -- is fatal: see unimut.langs for
+    # why there's no partial-success mode to fall back to.
+    try:
+        languages = _get_languages()
+    except MutationError as exc:
+        print(f"unimut: error: {exc}", file=sys.stderr)
+        return 1
+
+    args = build_arg_parser(languages).parse_args(argv)
 
     if args.jobs < 1:
         print("unimut: error: --jobs must be at least 1", file=sys.stderr)
@@ -793,7 +814,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"unimut: error: no such file: {file_path}", file=sys.stderr)
         return 1
 
-    language = _detect_language(file_path, args.lang)
+    language = _detect_language(file_path, args.lang, languages)
     original_source = file_path.read_text()
 
     # --diff implies whole-file scanning: it needs to see every statement
@@ -839,7 +860,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         mutants = language.generate_mutants(
             str(file_path), original_source, **generate_kwargs
         )
-    except mutate_c.MutationError as exc:
+    except MutationError as exc:
         print(f"unimut: error: {exc}", file=sys.stderr)
         return 1
 
