@@ -26,8 +26,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/grug-lang/unimut"
-Issues = "https://github.com/grug-lang/unimut/issues"
+Homepage = "https://github.com/MyNameIsTrez/unimut"
+Issues = "https://github.com/MyNameIsTrez/unimut/issues"
 
 [project.scripts]
 unimut = "unimut.unimut:main"
